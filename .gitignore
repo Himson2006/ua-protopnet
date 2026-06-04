@@ -15,8 +15,10 @@ build/
 *.pdf
 
 # Data (never commit raw medical data)
-datasets/
-data/
+# NOTE: anchored with a leading slash so this matches ONLY the top-level data
+# directory, not the Python package uncertainty_extension/datasets/.
+/datasets/
+/data/
 HAM Dataset/
 *.dcm
 *.mhd
