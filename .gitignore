@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Conda
+*.conda
+# PyTorch installed manually — see README or Sections 11A/11B for install commands
+.env
+
+# Upstream ProtoPNet paper materials (large binaries, not needed for training)
+*.pdf
+
+# Data (never commit raw medical data)
+datasets/
+data/
+HAM Dataset/
+*.dcm
+*.mhd
+*.raw
+*.nii
+*.nii.gz
+
+# Model checkpoints (large binary files)
+saved_models/
+*.pth
+*.pt
+*.ckpt
+checkpoints/
+
+# ProtoPNet prototype images (generated, not source)
+img/
+prototype_results/
+runs/
+
+# Results and logs
+results/
+logs/
+wandb/
+*.log
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
