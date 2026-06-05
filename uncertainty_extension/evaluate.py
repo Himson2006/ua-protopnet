@@ -227,6 +227,7 @@ def collect_predictions(
     device,
     temperature: float = 1.0,
     forward_fn: Optional[Callable] = None,
+    uncertainty_source: str = "logits",
 ) -> Dict[str, np.ndarray]:
     """Run the model over a dataloader and collect per-sample arrays.
 
@@ -246,7 +247,7 @@ def collect_predictions(
     model.eval()
     out: Dict[str, List] = {k: [] for k in (
         "preds", "labels", "confidences", "accuracies", "is_incorrect",
-        "entropy", "competition", "radiologist_std", "class_evidence")}
+        "entropy", "competition", "radiologist_std", "class_evidence", "score")}
 
     for batch in dataloader:
         images = batch[0].to(device)
@@ -270,10 +271,15 @@ def collect_predictions(
         labels_cpu = labels.cpu()
         correct = (preds == labels_cpu)
 
-        entropy = compute_uncertainty_entropy(class_evidence, temperature)
-        competition = compute_prototype_competition_score(class_evidence)
+        # Uncertainty source: 'logits' uses the actual decision (recommended —
+        # the per-class max similarity is ~uniform and saturates entropy);
+        # 'evidence' uses class_evidence (the original spec definition).
+        score = logits if uncertainty_source == "logits" else class_evidence
+        entropy = compute_uncertainty_entropy(score, temperature)
+        competition = compute_prototype_competition_score(score)
         if uncertainty is None:
             uncertainty = entropy  # default scalar uncertainty = entropy
+        out["score"].append(score.cpu().numpy())
 
         out["preds"].append(preds.numpy())
         out["labels"].append(labels_cpu.numpy())
@@ -311,6 +317,7 @@ def run_full_evaluation(
     temperature: float = 1.0,
     forward_fn: Optional[Callable] = None,
     n_ece_bins: int = 15,
+    uncertainty_source: str = "logits",
 ) -> Dict[str, object]:
     """Full evaluation pass returning a comprehensive metrics dict.
 
@@ -337,7 +344,8 @@ def run_full_evaluation(
         ``radiologist_correlation`` (dict). Also echoes ``n_samples``.
     """
     pred = collect_predictions(model, dataloader, num_classes, K, device,
-                               temperature=temperature, forward_fn=forward_fn)
+                               temperature=temperature, forward_fn=forward_fn,
+                               uncertainty_source=uncertainty_source)
 
     # Samples with label < 0 are held-out (e.g. the binary-mode ambiguous nodules
     # with no valid class label): exclude them from accuracy / ECE / error-AUROC,
@@ -388,16 +396,17 @@ def calibrate_temperature(
     device,
     candidates: Sequence[float] = (0.5, 0.75, 1.0, 1.5, 2.0),
     n_ece_bins: int = 15,
+    uncertainty_source: str = "logits",
 ) -> float:
     """Select the temperature in ``candidates`` minimizing validation ECE.
 
-    Confidence for ECE is taken as the max softmax probability of the
-    *temperature-scaled class evidence* (so the swept T actually affects the
-    calibration objective). Returns the best T.
+    Confidence for ECE is the max softmax probability of the *temperature-scaled
+    score* (logits by default, else class evidence), so the swept T actually
+    affects the calibration objective. Returns the best T.
     """
     pred = collect_predictions(model, val_loader, num_classes, K, device,
-                               temperature=1.0)
-    evidence = torch.tensor(pred["class_evidence"], dtype=torch.float32)
+                               temperature=1.0, uncertainty_source=uncertainty_source)
+    evidence = torch.tensor(pred["score"], dtype=torch.float32)
     labels = torch.tensor(pred["labels"])
     valid = labels >= 0  # ignore held-out (label -1) samples when calibrating
     evidence, labels = evidence[valid], labels[valid]

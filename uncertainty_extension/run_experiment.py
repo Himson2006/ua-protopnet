@@ -92,7 +92,8 @@ def train_one_model(args, bundle, ambiguous_fn, ambiguous_label, use_soft_labels
     def eval_fn(m):
         return run_full_evaluation(
             m, bundle.val_loader, bundle.num_classes, K, device,
-            ambiguous_label=ambiguous_label, temperature=args.temperature)
+            ambiguous_label=ambiguous_label, temperature=args.temperature,
+            uncertainty_source=args.uncertainty_source)
 
     cfg = TrainConfig(
         epochs_warm=args.epochs_warm, epochs_joint=args.epochs_joint,
@@ -154,7 +155,8 @@ def generate_extreme_visualizations(model, bundle, K, device, args, temperature)
     """Render explanation figures for the top-5 most & least uncertain samples."""
     from .visualize import visualize_uncertainty_explanation
     pred = collect_predictions(model, bundle.test_loader, bundle.num_classes, K,
-                               device, temperature=temperature)
+                               device, temperature=temperature,
+                               uncertainty_source=args.uncertainty_source)
     unc = pred["entropy"]
     labels = pred["labels"]
     order = np.argsort(unc)
@@ -257,6 +259,11 @@ def build_parser():
                    help="LIDC: train benign-vs-malignant on confident nodules; "
                         "hold out the indeterminate nodules as the ambiguous test "
                         "set (recommended — the 3-class task is not learnable).")
+    p.add_argument("--uncertainty_source", choices=["logits", "evidence"],
+                   default="logits",
+                   help="Compute uncertainty from softmax(logits) (default, "
+                        "recommended) or from class evidence (per-class max "
+                        "prototype similarity; saturates in practice).")
     return p
 
 
@@ -286,13 +293,14 @@ def main(argv: Optional[List[str]] = None):
 
     # ---- Temperature calibration on val (Section 10) ------------------- #
     best_T = calibrate_temperature(model, bundle.val_loader, bundle.num_classes,
-                                   K, device)
+                                   K, device, uncertainty_source=args.uncertainty_source)
     print(f"[run] calibrated temperature T = {best_T}")
 
     # ---- Test evaluation ----------------------------------------------- #
     results["ua"] = run_full_evaluation(
         model, bundle.test_loader, bundle.num_classes, K, device,
-        ambiguous_label=ambiguous_label, temperature=best_T)
+        ambiguous_label=ambiguous_label, temperature=best_T,
+        uncertainty_source=args.uncertainty_source)
     results["ua"]["provides_prototype_explanation"] = True
 
     proto_meta = build_prototype_metadata(args, bundle, history.get("prototype_source"))
@@ -311,7 +319,8 @@ def main(argv: Optional[List[str]] = None):
             lambda_u=0.0, lambda_div=0.0, tag="vanilla", seed=args.seed + 1)
         results["vanilla"] = run_full_evaluation(
             vanilla, bundle.test_loader, bundle.num_classes, K, device,
-            ambiguous_label=ambiguous_label, temperature=best_T)
+            ambiguous_label=ambiguous_label, temperature=best_T,
+            uncertainty_source=args.uncertainty_source)
 
         mc = MCDropoutProtoPNet(vanilla, n_samples=30)
         results["mc_dropout"] = run_full_evaluation(
