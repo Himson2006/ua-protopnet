@@ -376,14 +376,57 @@ def get_ambiguous_mask(labels: torch.Tensor) -> torch.Tensor:
     return labels == AMBIGUOUS_LABEL
 
 
+def _verify_pylidc() -> None:
+    """Preflight: confirm pylidc + the DICOM path are wired up correctly.
+
+    Checks the bundled annotation DB is queryable and that at least one scan's
+    DICOM volume actually loads from the path in ~/.pylidcrc.
+    """
+    try:
+        import pylidc as pl
+    except Exception as e:
+        print(f"[verify] FAIL: cannot import pylidc ({e}). "
+              f"pip install pylidc pydicom"); return
+    n_scans = pl.query(pl.Scan).count()
+    print(f"[verify] pylidc annotation DB OK: {n_scans} scans "
+          f"(expected 1018 for full LIDC-IDRI)")
+    scan = pl.query(pl.Scan).first()
+    if scan is None:
+        print("[verify] FAIL: no scans in DB."); return
+    print(f"[verify] first scan: patient_id={scan.patient_id}")
+    try:
+        vol = scan.to_volume()
+        print(f"[verify] DICOM load OK: volume shape {vol.shape} "
+              f"(your ~/.pylidcrc 'path' points at the images correctly)")
+    except Exception as e:
+        print(f"[verify] FAIL: scan.to_volume() errored ({e}). "
+              f"Check the 'path' in ~/.pylidcrc points at the folder "
+              f"containing the LIDC-IDRI-XXXX directories.")
+        return
+    n3 = sum(1 for c in scan.cluster_annotations() if len(c) >= 3)
+    print(f"[verify] first scan has {n3} nodule(s) with >=3 annotators")
+    print("[verify] PASS — ready to build the cache.")
+
+
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(description="Build/inspect the LIDC cache")
-    p.add_argument("--data_dir", required=True, help="LIDC cache directory")
-    p.add_argument("--build", action="store_true", help="Force extraction")
+    p.add_argument("--data_dir", help="LIDC CACHE directory (output of extraction)")
+    p.add_argument("--build", action="store_true", help="Run extraction")
+    p.add_argument("--max_scans", type=int, default=None,
+                   help="Limit scans processed (use e.g. 20 for a quick test)")
+    p.add_argument("--verify", action="store_true",
+                   help="Only check pylidc + DICOM path are configured; no extraction")
     args = p.parse_args()
+
+    if args.verify:
+        _verify_pylidc()
+        raise SystemExit(0)
+
+    if not args.data_dir:
+        p.error("--data_dir is required unless --verify is used")
     if args.build:
-        extract_lidc_dataset(args.data_dir)
+        extract_lidc_dataset(args.data_dir, max_scans=args.max_scans)
     bundle = get_lidc_dataloaders(args.data_dir, build_if_missing=args.build)
     for name, ds in (("train", bundle.train_dataset), ("val", bundle.val_dataset),
                      ("test", bundle.test_dataset)):
