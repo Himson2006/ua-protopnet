@@ -57,8 +57,15 @@ def setup_dataset(args):
         ambiguous_label = _pairs_to_class_indices(DEFAULT_AMBIGUOUS_PAIRS)
         return bundle, ambiguous_fn, ambiguous_label, False
     elif args.dataset == "lidc":
-        from .datasets.lidc import AMBIGUOUS_LABEL, get_ambiguous_mask, get_lidc_dataloaders
-        bundle = get_lidc_dataloaders(args.data_dir, **common)
+        from .datasets.lidc import (AMBIGUOUS_LABEL, BINARY_AMBIGUOUS_LABEL,
+                                    get_ambiguous_mask, get_lidc_dataloaders)
+        bundle = get_lidc_dataloaders(args.data_dir, binary=args.binary, **common)
+        if args.binary:
+            # Held-out indeterminate nodules carry label -1; nothing in the
+            # train set is ambiguous, so the calibration loss just enforces
+            # certainty on the (confident) training samples. Hard labels only.
+            ambiguous_fn = lambda labels: labels == BINARY_AMBIGUOUS_LABEL
+            return bundle, ambiguous_fn, bundle.ambiguous_label, False
         ambiguous_fn = get_ambiguous_mask
         return bundle, ambiguous_fn, AMBIGUOUS_LABEL, True
     raise ValueError(f"unknown dataset {args.dataset!r}")
@@ -246,6 +253,10 @@ def build_parser():
     p.add_argument("--soft_labels", choices=["auto", "on", "off"], default="auto",
                    help="Override soft-label CE. 'auto' = on for LIDC, off for HAM. "
                         "Use 'off' to train LIDC on hard labels (diagnostic).")
+    p.add_argument("--binary", action="store_true",
+                   help="LIDC: train benign-vs-malignant on confident nodules; "
+                        "hold out the indeterminate nodules as the ambiguous test "
+                        "set (recommended — the 3-class task is not learnable).")
     return p
 
 

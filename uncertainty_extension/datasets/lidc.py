@@ -388,11 +388,15 @@ class LIDCDataset(Dataset):
     """
 
     def __init__(self, patches: np.ndarray, records: List[dict],
-                 train: bool = False, normalize: bool = True):
+                 train: bool = False, normalize: bool = True,
+                 label_key: str = "hard_label"):
         self.patches = patches
         self.records = records
         self.train = train
         self.normalize = normalize
+        # Which record field supplies the integer class label. Binary mode uses
+        # 'binary_label' (0=benign, 1=malignant, -1=held-out ambiguous).
+        self.label_key = label_key
         self._mean = torch.tensor(IMAGENET_MEAN).view(3, 1, 1)
         self._std = torch.tensor(IMAGENET_STD).view(3, 1, 1)
 
@@ -410,13 +414,14 @@ class LIDCDataset(Dataset):
         if self.normalize:
             image = (image - self._mean) / self._std
         rec = self.records[idx]
-        hard = int(rec["hard_label"])
+        hard = int(rec.get(self.label_key, rec["hard_label"]))
         soft = torch.tensor(rec["soft_label"], dtype=torch.float32)
         std = float(rec["std_malignancy"])
         return image, hard, soft, std
 
     def get_all_labels(self) -> torch.Tensor:
-        return torch.tensor([r["hard_label"] for r in self.records], dtype=torch.long)
+        return torch.tensor([r.get(self.label_key, r["hard_label"])
+                             for r in self.records], dtype=torch.long)
 
     def get_all_std(self) -> np.ndarray:
         return np.array([r["std_malignancy"] for r in self.records], dtype=float)
@@ -451,6 +456,35 @@ def _stratified_split(records, seed, ratios):
     return train, val, test
 
 
+#: Class names for the binary (benign vs malignant) reformulation.
+BINARY_CLASSES = ["benign", "malignant"]
+#: Sentinel label for held-out ambiguous (indeterminate) nodules in binary mode.
+BINARY_AMBIGUOUS_LABEL = -1
+
+
+def _binary_split(records, seed, ratios):
+    """Split for binary mode: stratify the CONFIDENT nodules (binary_label 0/1)
+    into train/val/test; route ALL ambiguous (label -1) nodules into test."""
+    rng = np.random.RandomState(seed)
+    by = {0: [], 1: []}
+    ambiguous = []
+    for i, r in enumerate(records):
+        bl = r["binary_label"]
+        (by[bl] if bl in (0, 1) else ambiguous).append(i)
+    train, val, test = [], [], []
+    for cls, idxs in by.items():
+        idxs = np.array(idxs)
+        rng.shuffle(idxs)
+        n = len(idxs)
+        n_tr = int(round(n * ratios[0]))
+        n_va = int(round(n * ratios[1]))
+        train += idxs[:n_tr].tolist()
+        val += idxs[n_tr:n_tr + n_va].tolist()
+        test += idxs[n_tr + n_va:].tolist()
+    test += ambiguous  # indeterminate nodules are a held-out test-only set
+    return train, val, test
+
+
 @dataclass
 class LIDCBundle:
     train_loader: DataLoader
@@ -465,6 +499,7 @@ class LIDCBundle:
     class_names: List[str] = field(default_factory=lambda: list(LIDC_CLASSES))
     num_classes: int = NUM_CLASSES
     ambiguous_label: int = AMBIGUOUS_LABEL
+    binary: bool = False
 
 
 def get_lidc_dataloaders(
@@ -477,6 +512,7 @@ def get_lidc_dataloaders(
     ratios: Tuple[float, float, float] = (0.70, 0.15, 0.15),
     max_samples: Optional[int] = None,
     build_if_missing: bool = True,
+    binary: bool = False,
     log=print,
 ) -> LIDCBundle:
     """Build train/val/test loaders for the cached LIDC dataset.
@@ -484,6 +520,13 @@ def get_lidc_dataloaders(
     ``data_dir`` is the cache directory (``lidc_patches.npz`` + ``lidc_meta.json``).
     If the cache is missing and ``build_if_missing``, :func:`extract_lidc_dataset`
     is invoked (needs ``pylidc``).
+
+    binary : bool
+        If True, reformulate as **benign (0) vs malignant (2 -> 1)** trained on
+        the confident nodules only; the indeterminate nodules (hard_label == 1)
+        are held out entirely into the test split with label ``-1`` (the
+        ambiguous evaluation set). This is the recommended setup: the 3-class
+        task with a trainable "uncertain" middle is not learnable.
     """
     npz_path = os.path.join(data_dir, "lidc_patches.npz")
     meta_path = os.path.join(data_dir, "lidc_meta.json")
@@ -503,18 +546,35 @@ def get_lidc_dataloaders(
         patches = patches[idx]
         records = [records[i] for i in idx]
 
-    tr, va, te = _stratified_split(records, seed, ratios)
+    if binary:
+        # benign(0)->0, malignant(2)->1, indeterminate(1)->-1 (held out)
+        for r in records:
+            r["binary_label"] = {0: 0, 2: 1}.get(int(r["hard_label"]), -1)
+        tr, va, te = _binary_split(records, seed, ratios)
+        label_key = "binary_label"
+        class_names, num_classes = list(BINARY_CLASSES), 2
+        amb_label = BINARY_AMBIGUOUS_LABEL
+    else:
+        tr, va, te = _stratified_split(records, seed, ratios)
+        label_key = "hard_label"
+        class_names, num_classes = list(LIDC_CLASSES), NUM_CLASSES
+        amb_label = AMBIGUOUS_LABEL
 
-    def subset(indices, train):
-        return LIDCDataset(patches[indices],
-                           [records[i] for i in indices], train=train)
+    def subset(indices, train, normalize=True):
+        idx = np.array(indices)
+        return LIDCDataset(patches[idx], [records[i] for i in indices],
+                           train=train, normalize=normalize, label_key=label_key)
 
-    train_ds = subset(np.array(tr), True)
-    val_ds = subset(np.array(va), False)
-    test_ds = subset(np.array(te), False)
+    train_ds = subset(tr, True)
+    val_ds = subset(va, False)
+    test_ds = subset(te, False)
     # Push set: train images, UNnormalized [0,1] 3-channel, for prototype saving.
-    push_ds = LIDCDataset(patches[np.array(tr)], [records[i] for i in tr],
-                          train=False, normalize=False)
+    push_ds = subset(tr, False, normalize=False)
+
+    if binary:
+        n_amb = sum(1 for i in te if records[i]["binary_label"] == -1)
+        log(f"[lidc] binary mode: train={len(tr)} val={len(va)} "
+            f"test={len(te)} (incl. {n_amb} held-out ambiguous nodules)")
 
     g = torch.Generator(); g.manual_seed(seed)
     common = dict(num_workers=num_workers, pin_memory=pin_memory)
@@ -529,6 +589,8 @@ def get_lidc_dataloaders(
                                shuffle=False, **common),
         train_dataset=train_ds, val_dataset=val_ds, test_dataset=test_ds,
         push_dataset=push_ds,
+        class_names=class_names, num_classes=num_classes,
+        ambiguous_label=amb_label, binary=binary,
     )
 
 

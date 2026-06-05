@@ -339,12 +339,21 @@ def run_full_evaluation(
     pred = collect_predictions(model, dataloader, num_classes, K, device,
                                temperature=temperature, forward_fn=forward_fn)
 
-    accuracy = float(pred["accuracies"].mean())
-    ece = compute_ece(pred["confidences"], pred["accuracies"], n_bins=n_ece_bins)
-    auroc = uncertainty_auroc(pred["entropy"], pred["is_incorrect"])
+    # Samples with label < 0 are held-out (e.g. the binary-mode ambiguous nodules
+    # with no valid class label): exclude them from accuracy / ECE / error-AUROC,
+    # but keep them for the uncertainty / correlation metrics below.
+    valid = pred["labels"] >= 0
+    if valid.any():
+        accuracy = float(pred["accuracies"][valid].mean())
+        ece = compute_ece(pred["confidences"][valid], pred["accuracies"][valid],
+                          n_bins=n_ece_bins)
+        auroc = uncertainty_auroc(pred["entropy"][valid], pred["is_incorrect"][valid])
+    else:
+        accuracy = ece = auroc = float("nan")
 
     metrics: Dict[str, object] = {
         "n_samples": int(pred["labels"].size),
+        "n_eval": int(valid.sum()),
         "accuracy": accuracy,
         "ece": ece,
         "uncertainty_auroc": auroc,
@@ -390,6 +399,8 @@ def calibrate_temperature(
                                temperature=1.0)
     evidence = torch.tensor(pred["class_evidence"], dtype=torch.float32)
     labels = torch.tensor(pred["labels"])
+    valid = labels >= 0  # ignore held-out (label -1) samples when calibrating
+    evidence, labels = evidence[valid], labels[valid]
     best_T, best_ece = 1.0, float("inf")
     for T in candidates:
         probs = F.softmax(evidence / T, dim=1)
