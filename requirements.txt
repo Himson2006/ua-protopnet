@@ -10,8 +10,9 @@ numpy>=1.24.0
 pandas>=2.0.0
 
 # ── Medical Imaging ───────────────────────────────────────────────────────
-pylidc>=0.2.1
+pylidc>=0.2.1            # only needed for the raw LIDC-IDRI/DICOM pipeline
 SimpleITK>=2.3.0
+nibabel>=5.0.0           # for LUNA22-ISMI .nii.gz nodule patches
 
 # ── Image Processing ──────────────────────────────────────────────────────
 opencv-python>=4.8.0

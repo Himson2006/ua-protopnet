@@ -124,13 +124,17 @@ def build_prototype_metadata(args, bundle, proto_source) -> List[dict]:
                             f"({', '.join(entry['tags'])})"
         elif args.dataset == "lidc" and 0 <= idx < len(push_ds.records):
             r = push_ds.records[idx]
-            from .datasets.lidc import CHARACTERISTICS
-            chars = {c: round(r[c], 2) for c in CHARACTERISTICS if c in r}
+            from .datasets.lidc import CHARACTERISTICS, LUNA22_CHARACTERISTICS
+            # Use whichever nodule characteristics are present (pylidc vs LUNA22).
+            char_keys = [c for c in (CHARACTERISTICS + LUNA22_CHARACTERISTICS)
+                         if c in r]
+            chars = {c: round(r[c], 2) for c in char_keys}
             entry["characteristics"] = chars
             entry["mean_malignancy"] = r.get("mean_malignancy")
-            entry["name"] = f"Prototype {rec.get('proto_idx')}: {entry['class_name']} " \
-                            f"(spiculation={chars.get('spiculation')}, " \
-                            f"malignancy={r.get('mean_malignancy'):.1f})"
+            char_str = ", ".join(f"{k}={v}" for k, v in chars.items())
+            entry["name"] = (f"Prototype {rec.get('proto_idx')}: {entry['class_name']} "
+                             f"(malignancy={r.get('mean_malignancy', float('nan')):.1f}"
+                             + (f", {char_str}" if char_str else "") + ")")
         meta.append(entry)
     return meta
 

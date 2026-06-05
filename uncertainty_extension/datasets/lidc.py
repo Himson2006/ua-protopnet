@@ -213,6 +213,168 @@ def _resize_2d(patch: np.ndarray, size: int) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
+# LUNA22-ISMI extractor (preprocessed nodule patches — no pylidc/DICOM needed)
+# --------------------------------------------------------------------------- #
+
+#: Characteristics available in the LUNA22-ISMI metadata (per-radiologist lists).
+LUNA22_CHARACTERISTICS = ["texture", "calcification", "diameter"]
+
+
+def _luna22_hard_label(mean_malignancy: float) -> int:
+    """LUNA22 label rule: 0 benign (<=2.5), 1 uncertain (2.5<m<=3.5), 2 malignant."""
+    if mean_malignancy <= 2.5:
+        return 0
+    if mean_malignancy <= 3.5:
+        return 1
+    return 2
+
+
+def _load_nii_slice(path: str, slice_axis: int = 2) -> np.ndarray:
+    """Load a .nii.gz patch and return its centered 2D slice along ``slice_axis``."""
+    try:
+        import nibabel as nib
+        vol = np.asarray(nib.load(path).get_fdata(), dtype=np.float32)
+    except Exception:
+        import SimpleITK as sitk
+        # SimpleITK returns (z, y, x); transpose to (x, y, z) to match the spec.
+        vol = np.transpose(sitk.GetArrayFromImage(sitk.ReadImage(path)), (2, 1, 0))
+        vol = vol.astype(np.float32)
+    center = vol.shape[slice_axis] // 2
+    return np.take(vol, center, axis=slice_axis)
+
+
+def extract_luna22_dataset(
+    luna_dir: str,
+    cache_dir: str,
+    patch_size: int = 224,
+    slice_axis: int = 2,
+    hu_window: bool = True,
+    log=print,
+) -> str:
+    """Build the standard LIDC cache from LUNA22-ISMI preprocessed patches.
+
+    Produces ``lidc_patches.npz`` + ``lidc_meta.json`` in ``cache_dir`` so the
+    existing :func:`get_lidc_dataloaders` / ``run_experiment --dataset lidc``
+    work unchanged. No pylidc / DICOM required.
+
+    Parameters
+    ----------
+    luna_dir : str
+        Folder containing ``LIDC-IDRI_1176.npy`` and the nodule ``.nii.gz`` files
+        (either already unzipped, or ``LIDC-IDRI_1176.zip`` which is unzipped
+        into ``<luna_dir>/images`` on first run).
+    cache_dir : str
+        Output directory for the cache (this is the ``--data_dir`` you later pass
+        to ``run_experiment``).
+    patch_size : int
+        Output square size of the 2D nodule slice (224 to match the backbone).
+    slice_axis : int
+        Axis of the centered slice (z=2 for the (x,y,z) patches; nodule centered
+        at index 32).
+    hu_window : bool
+        Apply a CT lung window (HU center -600, width 1500) -> [0,1]. Disable if
+        your patches are already intensity-normalized.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    npz_path = os.path.join(cache_dir, "lidc_patches.npz")
+    meta_path = os.path.join(cache_dir, "lidc_meta.json")
+    if os.path.isfile(npz_path) and os.path.isfile(meta_path):
+        log(f"[luna22] using existing cache at {npz_path}")
+        return npz_path
+
+    npy_path = os.path.join(luna_dir, "LIDC-IDRI_1176.npy")
+    if not os.path.isfile(npy_path):
+        raise FileNotFoundError(
+            f"LIDC-IDRI_1176.npy not found in {luna_dir}. Point --luna_dir at the "
+            f"folder containing the .npy and the nodule .nii.gz files / zip.")
+    entries = np.load(npy_path, allow_pickle=True)
+    log(f"[luna22] loaded metadata for {len(entries)} nodules")
+
+    # Locate the image files (unzip on first run if needed), index by filename.
+    img_index = _build_luna22_image_index(luna_dir, log=log)
+
+    patches: List[np.ndarray] = []
+    records: List[dict] = []
+    n_missing = 0
+    for nod in entries:
+        fname = nod["Filename"]
+        path = img_index.get(fname) or img_index.get(os.path.basename(fname))
+        if path is None:
+            n_missing += 1
+            continue
+        try:
+            sl = _load_nii_slice(path, slice_axis=slice_axis)
+        except Exception as e:
+            log(f"[luna22] skip {fname}: load failed ({e})")
+            continue
+        if hu_window:
+            sl = _window_normalize(sl)
+        else:
+            mn, mx = float(sl.min()), float(sl.max())
+            sl = (sl - mn) / (mx - mn + 1e-8)
+        sl = _resize_2d(sl.astype(np.float32), patch_size)
+
+        mal = [float(m) for m in nod["Malignancy"]]
+        mean_mal = float(np.mean(mal))
+        rec = {
+            "series_uid": str(nod.get("SeriesInstanceUID", "")),
+            "filename": str(fname),
+            "n_annotators": len(mal),
+            "mean_malignancy": mean_mal,
+            "std_malignancy": float(np.std(mal)),
+            "hard_label": _luna22_hard_label(mean_mal),
+            "soft_label": votes_to_soft_label(mal).tolist(),
+            "malignancy_scores": mal,
+        }
+        for key, src in (("texture", "Texture"), ("calcification", "Calcification"),
+                         ("diameter", "Diameter")):
+            if src in nod and nod[src] is not None and len(nod[src]) > 0:
+                rec[key] = float(np.mean([float(v) for v in nod[src]]))
+        patches.append(sl)
+        records.append(rec)
+
+    if not patches:
+        raise RuntimeError("[luna22] no patches extracted — check image files.")
+    if n_missing:
+        log(f"[luna22] WARNING: {n_missing} nodules had no matching image file")
+
+    np.savez_compressed(npz_path, patches=np.stack(patches))
+    with open(meta_path, "w") as f:
+        json.dump(records, f, indent=2)
+    dist = {LIDC_CLASSES[c]: sum(r["hard_label"] == c for r in records)
+            for c in range(NUM_CLASSES)}
+    log(f"[luna22] cached {len(patches)} patches -> {npz_path}  class dist={dist}")
+    return npz_path
+
+
+def _build_luna22_image_index(luna_dir: str, log=print) -> Dict[str, str]:
+    """Map nodule filename -> path, unzipping LIDC-IDRI_1176.zip if necessary."""
+    import zipfile
+
+    def _index(root: str) -> Dict[str, str]:
+        idx: Dict[str, str] = {}
+        for r, _d, files in os.walk(root):
+            for fn in files:
+                if fn.endswith(".nii.gz") or fn.endswith(".nii"):
+                    idx.setdefault(fn, os.path.join(r, fn))
+        return idx
+
+    idx = _index(luna_dir)
+    if idx:
+        return idx
+    zip_path = os.path.join(luna_dir, "LIDC-IDRI_1176.zip")
+    if os.path.isfile(zip_path):
+        out = os.path.join(luna_dir, "images")
+        log(f"[luna22] unzipping {zip_path} -> {out} (first run only)")
+        os.makedirs(out, exist_ok=True)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(out)
+        return _index(out)
+    raise FileNotFoundError(
+        f"No .nii.gz images and no LIDC-IDRI_1176.zip found in {luna_dir}")
+
+
+# --------------------------------------------------------------------------- #
 # Dataset
 # --------------------------------------------------------------------------- #
 
@@ -412,9 +574,14 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(description="Build/inspect the LIDC cache")
     p.add_argument("--data_dir", help="LIDC CACHE directory (output of extraction)")
-    p.add_argument("--build", action="store_true", help="Run extraction")
+    p.add_argument("--build", action="store_true", help="Run extraction (pylidc source)")
+    p.add_argument("--from_luna22", metavar="LUNA_DIR", default=None,
+                   help="Build the cache from LUNA22-ISMI patches in LUNA_DIR "
+                        "(contains LIDC-IDRI_1176.npy + .nii.gz / .zip). No pylidc needed.")
+    p.add_argument("--patch_size", type=int, default=224,
+                   help="Output slice size for LUNA22 extraction (match backbone)")
     p.add_argument("--max_scans", type=int, default=None,
-                   help="Limit scans processed (use e.g. 20 for a quick test)")
+                   help="Limit scans processed for pylidc (use e.g. 20 for a quick test)")
     p.add_argument("--verify", action="store_true",
                    help="Only check pylidc + DICOM path are configured; no extraction")
     args = p.parse_args()
@@ -424,8 +591,11 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     if not args.data_dir:
-        p.error("--data_dir is required unless --verify is used")
-    if args.build:
+        p.error("--data_dir is required (the cache output directory)")
+    if args.from_luna22:
+        extract_luna22_dataset(args.from_luna22, args.data_dir,
+                               patch_size=args.patch_size)
+    elif args.build:
         extract_lidc_dataset(args.data_dir, max_scans=args.max_scans)
     bundle = get_lidc_dataloaders(args.data_dir, build_if_missing=args.build)
     for name, ds in (("train", bundle.train_dataset), ("val", bundle.val_dataset),
