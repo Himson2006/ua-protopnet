@@ -291,6 +291,12 @@ def main(argv: Optional[List[str]] = None):
         args, bundle, ambiguous_fn, ambiguous_label, use_soft, device,
         args.lambda_u, args.lambda_div, tag="ua", seed=args.seed)
 
+    # Did the model ever fit the training data? (best train acc across epochs)
+    train_accs = [h.get("accuracy", 0.0) for h in history.get("train", [])]
+    best_train_acc = max(train_accs) if train_accs else float("nan")
+    print(f"[run] best TRAIN accuracy across epochs = {best_train_acc:.4f} "
+          f"(if this is ~majority-baseline, the model is not learning the task)")
+
     # ---- Temperature calibration on val (Section 10) ------------------- #
     best_T = calibrate_temperature(model, bundle.val_loader, bundle.num_classes,
                                    K, device, uncertainty_source=args.uncertainty_source)
@@ -302,6 +308,7 @@ def main(argv: Optional[List[str]] = None):
         ambiguous_label=ambiguous_label, temperature=best_T,
         uncertainty_source=args.uncertainty_source)
     results["ua"]["provides_prototype_explanation"] = True
+    results["ua"]["best_train_acc"] = float(best_train_acc)
 
     proto_meta = build_prototype_metadata(args, bundle, history.get("prototype_source"))
     with open(os.path.join(args.output_dir, "prototype_metadata.json"), "w") as f:

@@ -243,12 +243,22 @@ def _load_nii_slice(path: str, slice_axis: int = 2) -> np.ndarray:
     return np.take(vol, center, axis=slice_axis)
 
 
+def _center_crop_2d(arr: np.ndarray, size: int) -> np.ndarray:
+    """Central size x size crop of a 2D array (nodule is centered in the patch)."""
+    h, w = arr.shape
+    if size is None or size >= min(h, w):
+        return arr
+    top, left = (h - size) // 2, (w - size) // 2
+    return arr[top:top + size, left:left + size]
+
+
 def extract_luna22_dataset(
     luna_dir: str,
     cache_dir: str,
     patch_size: int = 224,
     slice_axis: int = 2,
     hu_window: bool = True,
+    crop: Optional[int] = None,
     log=print,
 ) -> str:
     """Build the standard LIDC cache from LUNA22-ISMI preprocessed patches.
@@ -312,6 +322,8 @@ def extract_luna22_dataset(
         else:
             mn, mx = float(sl.min()), float(sl.max())
             sl = (sl - mn) / (mx - mn + 1e-8)
+        if crop:
+            sl = _center_crop_2d(sl, crop)   # zoom in on the centered nodule
         sl = _resize_2d(sl.astype(np.float32), patch_size)
 
         mal = [float(m) for m in nod["Malignancy"]]
@@ -343,7 +355,9 @@ def extract_luna22_dataset(
         json.dump(records, f, indent=2)
     dist = {LIDC_CLASSES[c]: sum(r["hard_label"] == c for r in records)
             for c in range(NUM_CLASSES)}
-    log(f"[luna22] cached {len(patches)} patches -> {npz_path}  class dist={dist}")
+    crop_note = f"crop={crop}->{patch_size}" if crop else f"no-crop->{patch_size}"
+    log(f"[luna22] cached {len(patches)} patches ({crop_note}) -> {npz_path}  "
+        f"class dist={dist}")
     return npz_path
 
 
@@ -642,6 +656,9 @@ if __name__ == "__main__":
                         "(contains LIDC-IDRI_1176.npy + .nii.gz / .zip). No pylidc needed.")
     p.add_argument("--patch_size", type=int, default=224,
                    help="Output slice size for LUNA22 extraction (match backbone)")
+    p.add_argument("--crop", type=int, default=None,
+                   help="LUNA22: central crop (in the 128px patch) around the "
+                        "nodule BEFORE resizing — zooms in (try 64). Default: none.")
     p.add_argument("--max_scans", type=int, default=None,
                    help="Limit scans processed for pylidc (use e.g. 20 for a quick test)")
     p.add_argument("--verify", action="store_true",
@@ -656,7 +673,7 @@ if __name__ == "__main__":
         p.error("--data_dir is required (the cache output directory)")
     if args.from_luna22:
         extract_luna22_dataset(args.from_luna22, args.data_dir,
-                               patch_size=args.patch_size)
+                               patch_size=args.patch_size, crop=args.crop)
     elif args.build:
         extract_lidc_dataset(args.data_dir, max_scans=args.max_scans)
     bundle = get_lidc_dataloaders(args.data_dir, build_if_missing=args.build)
