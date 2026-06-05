@@ -398,16 +398,21 @@ class HAM10000Bundle:
 
 def _maybe_subsample(df: pd.DataFrame, max_samples: Optional[int],
                      seed: int) -> pd.DataFrame:
-    """Stratified subsample down to ~max_samples rows (for smoke tests)."""
+    """Stratified subsample down to ~max_samples rows (for smoke tests).
+
+    Iterates groups explicitly rather than ``groupby(...).apply(...)``: on
+    pandas >= 2.2 the latter drops the grouping column ('label') from the
+    result, which breaks the downstream split.
+    """
     if max_samples is None or len(df) <= max_samples:
         return df
     frac = max_samples / len(df)
-    rng = seed
     # Keep at least one sample per class where possible.
-    out = (df.groupby("label", group_keys=False)
-             .apply(lambda g: g.sample(max(1, int(round(len(g) * frac))),
-                                       random_state=rng)))
-    return out.reset_index(drop=True)
+    parts = []
+    for _label, group in df.groupby("label", sort=True):
+        n = max(1, int(round(len(group) * frac)))
+        parts.append(group.sample(n=min(n, len(group)), random_state=seed))
+    return pd.concat(parts).reset_index(drop=True)
 
 
 def get_ham10000_dataloaders(
