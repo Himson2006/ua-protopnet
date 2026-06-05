@@ -243,6 +243,9 @@ def build_parser():
     p.add_argument("--multi_gpu", action="store_true")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--soft_labels", choices=["auto", "on", "off"], default="auto",
+                   help="Override soft-label CE. 'auto' = on for LIDC, off for HAM. "
+                        "Use 'off' to train LIDC on hard labels (diagnostic).")
     return p
 
 
@@ -255,8 +258,13 @@ def main(argv: Optional[List[str]] = None):
     print(f"[run] dataset={args.dataset} backbone={args.backbone} device={device}")
 
     bundle, ambiguous_fn, ambiguous_label, use_soft = setup_dataset(args)
+    if args.soft_labels == "on":
+        use_soft = True
+    elif args.soft_labels == "off":
+        use_soft = False
     print(f"[run] train={len(bundle.train_dataset)} val={len(bundle.val_dataset)} "
-          f"test={len(bundle.test_dataset)} classes={bundle.num_classes}")
+          f"test={len(bundle.test_dataset)} classes={bundle.num_classes} "
+          f"soft_labels={use_soft}")
 
     results: Dict[str, dict] = {}
 
