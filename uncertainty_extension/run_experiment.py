@@ -272,12 +272,155 @@ def build_parser():
                    help="LIDC: train P(malignant) to match the radiologist vote "
                         "fraction (soft regression). Confidence is calibrated to "
                         "agreement, so uncertainty should track radiologist std.")
-    p.add_argument("--uncertainty_source", choices=["logits", "evidence"],
+    p.add_argument("--uncertainty_source", choices=["logits", "evidence", "distance"],
                    default="logits",
-                   help="Compute uncertainty from softmax(logits) (default, "
-                        "recommended) or from class evidence (per-class max "
-                        "prototype similarity; saturates in practice).")
+                   help="Uncertainty signal: 'logits' = entropy of softmax(logits) "
+                        "(default); 'evidence' = entropy of class evidence "
+                        "(saturates); 'distance' = atypicality (distance to nearest "
+                        "prototype).")
+    p.add_argument("--seeds", default=None,
+                   help="Comma-separated model seeds for multi-seed runs, e.g. "
+                        "'0,1,2'. Reports mean+/-std per metric. The data split is "
+                        "fixed by --seed; only model init/training varies. Default: "
+                        "single run with --seed.")
     return p
+
+
+def _difficulty_array(args, dataset):
+    """Image-independent case-difficulty score per sample (LIDC only).
+
+    Returns boundary-proximity = -|mean_malignancy - 3| so that a POSITIVE
+    correlation with uncertainty means 'more uncertain near the benign/malignant
+    boundary'. The model never sees this, so the correlation is not circular.
+    """
+    if args.dataset != "lidc":
+        return None
+    return np.array([-(abs(float(r.get("mean_malignancy", 3.0)) - 3.0))
+                     for r in dataset.records], dtype=float)
+
+
+def single_run(args, bundle, ambiguous_fn, eval_ambiguous, test_ambiguous,
+               use_soft, test_difficulty, device, seed, do_artifacts):
+    """Train + evaluate UA (and baselines) once at the given model seed."""
+    results: Dict[str, dict] = {}
+    usrc = args.uncertainty_source
+
+    model, history, K = train_one_model(
+        args, bundle, ambiguous_fn, eval_ambiguous, use_soft, device,
+        args.lambda_u, args.lambda_div, tag="ua", seed=seed)
+
+    train_accs = [h.get("accuracy", 0.0) for h in history.get("train", [])]
+    best_train_acc = max(train_accs) if train_accs else float("nan")
+    print(f"[seed {seed}] best TRAIN accuracy across epochs = {best_train_acc:.4f}")
+
+    best_T = calibrate_temperature(model, bundle.val_loader, bundle.num_classes,
+                                   K, device, uncertainty_source=usrc)
+    print(f"[seed {seed}] calibrated temperature T = {best_T}")
+
+    results["ua"] = run_full_evaluation(
+        model, bundle.test_loader, bundle.num_classes, K, device,
+        ambiguous_label=test_ambiguous, temperature=best_T,
+        uncertainty_source=usrc, difficulty=test_difficulty)
+    results["ua"]["provides_prototype_explanation"] = True
+    results["ua"]["best_train_acc"] = float(best_train_acc)
+
+    if do_artifacts:
+        proto_meta = build_prototype_metadata(args, bundle,
+                                              history.get("prototype_source"))
+        with open(os.path.join(args.output_dir, "prototype_metadata.json"), "w") as f:
+            json.dump(proto_meta, f, indent=2)
+        generate_extreme_visualizations(model, bundle, K, device, args, best_T)
+
+    if args.run_baselines:
+        from .baselines import EnsembleProtoPNet, MCDropoutProtoPNet
+        vanilla, _vh, _vk = train_one_model(
+            args, bundle, ambiguous_fn, eval_ambiguous, use_soft, device,
+            lambda_u=0.0, lambda_div=0.0, tag="vanilla", seed=seed + 1)
+        results["vanilla"] = run_full_evaluation(
+            vanilla, bundle.test_loader, bundle.num_classes, K, device,
+            ambiguous_label=test_ambiguous, temperature=best_T,
+            uncertainty_source=usrc, difficulty=test_difficulty)
+
+        mc = MCDropoutProtoPNet(vanilla, n_samples=30)
+        results["mc_dropout"] = run_full_evaluation(
+            mc, bundle.test_loader, bundle.num_classes, K, device,
+            ambiguous_label=test_ambiguous, temperature=best_T,
+            forward_fn=mc.forward_fn(), difficulty=test_difficulty)
+
+        members = [vanilla]
+        for s in range(1, max(1, args.ensemble_size)):
+            mem, _h, _k = train_one_model(
+                args, bundle, ambiguous_fn, eval_ambiguous, use_soft, device,
+                lambda_u=0.0, lambda_div=0.0, tag=f"ens_{s}", seed=seed + 10 + s)
+            members.append(mem)
+        ens = EnsembleProtoPNet(members)
+        results["ensemble"] = run_full_evaluation(
+            ens, bundle.test_loader, bundle.num_classes, K, device,
+            ambiguous_label=test_ambiguous, temperature=best_T,
+            forward_fn=ens.forward_fn(), difficulty=test_difficulty)
+
+    return results, best_T
+
+
+#: (json path, display label, format) for metrics aggregated across seeds.
+_AGG_METRICS = [
+    ("accuracy", "Accuracy", "{:.3f}"),
+    ("ece", "ECE", "{:.3f}"),
+    ("uncertainty_auroc", "Unc. AUROC", "{:.3f}"),
+    ("ambiguous_vs_clear.ratio", "Ambig/Clear ratio", "{:.2f}"),
+    ("ambiguous_vs_clear.p_value", "  (ratio p-value)", "{:.3f}"),
+    ("radiologist_correlation.pearson_r", "Pearson r (rad std)", "{:.3f}"),
+    ("difficulty_correlation.pearson_r", "Pearson r (difficulty)", "{:.3f}"),
+]
+
+
+def _get_path(d, path):
+    cur = d
+    for key in path.split("."):
+        if not isinstance(cur, dict) or key not in cur:
+            return None
+        cur = cur[key]
+    return cur if isinstance(cur, (int, float)) else None
+
+
+def aggregate_over_seeds(results_per_seed):
+    """Aggregate per-seed results into {method: {path: (mean, std, n)}}."""
+    methods = []
+    for r in results_per_seed:
+        for m in r:
+            if m not in methods:
+                methods.append(m)
+    agg = {}
+    for m in methods:
+        agg[m] = {}
+        for path, _label, _fmt in _AGG_METRICS:
+            vals = [_get_path(r[m], path) for r in results_per_seed if m in r]
+            vals = [v for v in vals if v is not None and v == v]
+            if vals:
+                agg[m][path] = (float(np.mean(vals)), float(np.std(vals)), len(vals))
+    return agg
+
+
+def print_aggregated_table(agg, n_seeds):
+    methods = [m for m in ("vanilla", "mc_dropout", "ensemble", "ua") if m in agg]
+    headers = {"vanilla": "Vanilla", "mc_dropout": "MC Dropout",
+               "ensemble": "Ensemble", "ua": "UA-ProtoPNet (Ours)"}
+    cw = 24
+    line = "| {:<24} |".format(f"Metric (mean+/-std, n={n_seeds})") + "".join(
+        " {:^{w}} |".format(headers[m], w=cw) for m in methods)
+    print("\n" + "=" * len(line)); print(line)
+    print("|" + "-" * (len(line) - 2) + "|")
+    for path, label, fmt in _AGG_METRICS:
+        cells = []
+        for m in methods:
+            v = agg[m].get(path)
+            cells.append(f"{fmt.format(v[0])}+/-{fmt.format(v[1])}" if v else "—")
+        print("| {:<24} |".format(label) + "".join(
+            " {:^{w}} |".format(c, w=cw) for c in cells))
+    # Interpretability row.
+    print("| {:<24} |".format("Prototype explanation") + "".join(
+        " {:^{w}} |".format("Yes" if m == "ua" else "No", w=cw) for m in methods))
+    print("=" * len(line) + "\n")
 
 
 def main(argv: Optional[List[str]] = None):
@@ -297,9 +440,8 @@ def main(argv: Optional[List[str]] = None):
           f"test={len(bundle.test_dataset)} classes={bundle.num_classes} "
           f"soft_labels={use_soft}")
 
-    # In binary-soft mode the ambiguous (indeterminate) nodules cut across both
-    # classes, so the ambiguous group is a per-split boolean mask rather than a
-    # label value. Otherwise val and test share the same label-based group.
+    # Ambiguous group: per-split mask in binary-soft mode (indeterminate nodules
+    # cut across both classes), else a shared label value.
     if args.binary_soft:
         eval_ambiguous = np.array([r["is_ambiguous"]
                                    for r in bundle.val_dataset.records], dtype=bool)
@@ -307,76 +449,31 @@ def main(argv: Optional[List[str]] = None):
                                    for r in bundle.test_dataset.records], dtype=bool)
     else:
         eval_ambiguous = test_ambiguous = ambiguous_label
+    test_difficulty = _difficulty_array(args, bundle.test_dataset)
 
-    results: Dict[str, dict] = {}
+    seeds = ([int(s) for s in args.seeds.split(",")] if args.seeds
+             else [args.seed])
 
-    # ---- Train UA-ProtoPNet (ours) ------------------------------------- #
-    model, history, K = train_one_model(
-        args, bundle, ambiguous_fn, eval_ambiguous, use_soft, device,
-        args.lambda_u, args.lambda_div, tag="ua", seed=args.seed)
+    results_per_seed = []
+    for i, seed in enumerate(seeds):
+        print(f"\n===== seed {seed} ({i + 1}/{len(seeds)}) =====")
+        res, best_T = single_run(args, bundle, ambiguous_fn, eval_ambiguous,
+                                 test_ambiguous, use_soft, test_difficulty,
+                                 device, seed, do_artifacts=(i == 0))
+        results_per_seed.append(res)
 
-    # Did the model ever fit the training data? (best train acc across epochs)
-    train_accs = [h.get("accuracy", 0.0) for h in history.get("train", [])]
-    best_train_acc = max(train_accs) if train_accs else float("nan")
-    print(f"[run] best TRAIN accuracy across epochs = {best_train_acc:.4f} "
-          f"(if this is ~majority-baseline, the model is not learning the task)")
+    summary = {"args": vars(args), "seeds": seeds,
+               "results_per_seed": results_per_seed}
+    if len(seeds) > 1:
+        agg = aggregate_over_seeds(results_per_seed)
+        summary["aggregated"] = {m: {p: list(v) for p, v in d.items()}
+                                 for m, d in agg.items()}
+        print_aggregated_table(agg, len(seeds))
+    else:
+        print_results_table(results_per_seed[0])
 
-    # ---- Temperature calibration on val (Section 10) ------------------- #
-    best_T = calibrate_temperature(model, bundle.val_loader, bundle.num_classes,
-                                   K, device, uncertainty_source=args.uncertainty_source)
-    print(f"[run] calibrated temperature T = {best_T}")
-
-    # ---- Test evaluation ----------------------------------------------- #
-    results["ua"] = run_full_evaluation(
-        model, bundle.test_loader, bundle.num_classes, K, device,
-        ambiguous_label=test_ambiguous, temperature=best_T,
-        uncertainty_source=args.uncertainty_source)
-    results["ua"]["provides_prototype_explanation"] = True
-    results["ua"]["best_train_acc"] = float(best_train_acc)
-
-    proto_meta = build_prototype_metadata(args, bundle, history.get("prototype_source"))
-    with open(os.path.join(args.output_dir, "prototype_metadata.json"), "w") as f:
-        json.dump(proto_meta, f, indent=2)
-
-    generate_extreme_visualizations(model, bundle, K, device, args, best_T)
-
-    # ---- Baselines ------------------------------------------------------ #
-    if args.run_baselines:
-        from .baselines import EnsembleProtoPNet, MCDropoutProtoPNet
-
-        # Vanilla: same architecture trained WITHOUT uncertainty terms.
-        vanilla, _vh, _vk = train_one_model(
-            args, bundle, ambiguous_fn, eval_ambiguous, use_soft, device,
-            lambda_u=0.0, lambda_div=0.0, tag="vanilla", seed=args.seed + 1)
-        results["vanilla"] = run_full_evaluation(
-            vanilla, bundle.test_loader, bundle.num_classes, K, device,
-            ambiguous_label=test_ambiguous, temperature=best_T,
-            uncertainty_source=args.uncertainty_source)
-
-        mc = MCDropoutProtoPNet(vanilla, n_samples=30)
-        results["mc_dropout"] = run_full_evaluation(
-            mc, bundle.test_loader, bundle.num_classes, K, device,
-            ambiguous_label=test_ambiguous, temperature=best_T,
-            forward_fn=mc.forward_fn())
-
-        members = [vanilla]
-        for s in range(1, max(1, args.ensemble_size)):
-            mem, _h, _k = train_one_model(
-                args, bundle, ambiguous_fn, eval_ambiguous, use_soft, device,
-                lambda_u=0.0, lambda_div=0.0, tag=f"ens_{s}", seed=args.seed + 10 + s)
-            members.append(mem)
-        ens = EnsembleProtoPNet(members)
-        results["ensemble"] = run_full_evaluation(
-            ens, bundle.test_loader, bundle.num_classes, K, device,
-            ambiguous_label=test_ambiguous, temperature=best_T,
-            forward_fn=ens.forward_fn())
-
-    # ---- Save + print --------------------------------------------------- #
-    summary = {"args": vars(args), "calibrated_temperature": best_T,
-               "results": results}
     with open(os.path.join(args.output_dir, "results_summary.json"), "w") as f:
         json.dump(summary, f, indent=2, default=float)
-    print_results_table(results)
     print(f"[run] results written to {args.output_dir}/results_summary.json")
     return summary
 

@@ -163,10 +163,20 @@ def uncertainty_on_ambiguous_vs_clear(
     u_clear = float(u[clear_mask].mean()) if clear_mask.any() else float("nan")
     ratio = (u_amb / u_clear) if (u_clear and np.isfinite(u_clear) and
                                   u_clear != 0) else float("nan")
+    # One-sided significance: is uncertainty stochastically GREATER on ambiguous?
+    p_value = float("nan")
+    if amb_mask.sum() >= 2 and clear_mask.sum() >= 2:
+        try:
+            from scipy.stats import mannwhitneyu
+            p_value = float(mannwhitneyu(u[amb_mask], u[clear_mask],
+                                         alternative="greater").pvalue)
+        except Exception:
+            p_value = float("nan")
     return {
         "u_ambiguous": u_amb,
         "u_clear": u_clear,
         "ratio": ratio,
+        "p_value": p_value,   # Mann-Whitney, H1: U(ambiguous) > U(clear)
         "n_ambiguous": int(amb_mask.sum()),
         "n_clear": int(clear_mask.sum()),
     }
@@ -254,10 +264,11 @@ def collect_predictions(
         labels = batch[1]
         rad_std = batch[3] if len(batch) >= 4 else None
 
+        min_distances = None
         if forward_fn is not None:
             logits, class_evidence, uncertainty = forward_fn(model, images)
         else:
-            logits, _min_d, sims = forward_with_similarity(model, images)
+            logits, min_distances, sims = forward_with_similarity(model, images)
             class_evidence = compute_class_evidence(sims, num_classes, K)
             uncertainty = None
 
@@ -271,14 +282,19 @@ def collect_predictions(
         labels_cpu = labels.cpu()
         correct = (preds == labels_cpu)
 
-        # Uncertainty source: 'logits' uses the actual decision (recommended —
-        # the per-class max similarity is ~uniform and saturates entropy);
-        # 'evidence' uses class_evidence (the original spec definition).
-        score = logits if uncertainty_source == "logits" else class_evidence
+        # Uncertainty source:
+        #   'logits'   entropy of softmax(logits) — the actual decision (default);
+        #   'evidence' entropy of class_evidence (original spec; saturates);
+        #   'distance' atypicality = distance to the nearest prototype (large =
+        #              the input matches no learned exemplar well = uncertain).
+        score = class_evidence if uncertainty_source == "evidence" else logits
         entropy = compute_uncertainty_entropy(score, temperature)
         competition = compute_prototype_competition_score(score)
+        if uncertainty_source == "distance" and min_distances is not None:
+            # Closest-prototype distance per sample (higher = more atypical).
+            entropy = min_distances.min(dim=1).values
         if uncertainty is None:
-            uncertainty = entropy  # default scalar uncertainty = entropy
+            uncertainty = entropy  # default scalar uncertainty
         out["score"].append(score.cpu().numpy())
 
         out["preds"].append(preds.numpy())
@@ -318,6 +334,7 @@ def run_full_evaluation(
     forward_fn: Optional[Callable] = None,
     n_ece_bins: int = 15,
     uncertainty_source: str = "logits",
+    difficulty: Optional[np.ndarray] = None,
 ) -> Dict[str, object]:
     """Full evaluation pass returning a comprehensive metrics dict.
 
@@ -380,6 +397,14 @@ def run_full_evaluation(
     if std is not None:
         metrics["radiologist_correlation"] = correlation_with_radiologist_std(
             pred["entropy"], std)
+
+    # Honest "uncertainty tracks case difficulty" correlation. ``difficulty`` is
+    # an image-independent difficulty score per test sample (e.g. proximity to
+    # the decision boundary, |mean_malignancy - 3|). Not circular: the model
+    # never sees it. Pearson via the same helper.
+    if difficulty is not None:
+        metrics["difficulty_correlation"] = correlation_with_radiologist_std(
+            pred["entropy"], difficulty)
 
     return metrics
 
