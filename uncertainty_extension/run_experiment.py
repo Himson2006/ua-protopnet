@@ -160,8 +160,23 @@ def build_prototype_metadata(args, bundle, proto_source) -> List[dict]:
 # Visualization of extreme samples (Section 8.5)
 # --------------------------------------------------------------------------- #
 
-def generate_extreme_visualizations(model, bundle, K, device, args, temperature):
-    """Render explanation figures for the top-5 most & least uncertain samples."""
+def _high_stakes_class(args, bundle):
+    """Index of the class whose missed-detection is most dangerous (for hero cases)."""
+    if args.dataset == "ham10000" and "mel" in bundle.class_names:
+        return bundle.class_names.index("mel")          # melanoma
+    if args.dataset == "lidc":
+        return bundle.num_classes - 1                   # malignant (last class)
+    return None
+
+
+def generate_extreme_visualizations(model, bundle, K, device, args, temperature,
+                                    prototype_metadata=None):
+    """Render explanation figures: most/least uncertain + dangerous-miss 'hero' cases.
+
+    Hero cases = samples where a high-stakes class (e.g. melanoma) is a strong
+    competitor in the top-2 but is NOT the prediction — exactly the situation the
+    competing-prototype explanation is meant to surface to a clinician.
+    """
     from .visualize import visualize_uncertainty_explanation
     pred = collect_predictions(model, bundle.test_loader, bundle.num_classes, K,
                                device, temperature=temperature,
@@ -169,16 +184,28 @@ def generate_extreme_visualizations(model, bundle, K, device, args, temperature)
     unc = pred["entropy"]
     labels = pred["labels"]
     order = np.argsort(unc)
-    least = order[:5]
-    most = order[-5:][::-1]
+    groups = {"most_uncertain": order[-5:][::-1], "least_uncertain": order[:5]}
+
+    # Hero (dangerous-miss) selection from the decision distribution.
+    hs = _high_stakes_class(args, bundle)
+    if hs is not None and "score" in pred:
+        s = pred["score"]
+        s = s - s.max(axis=1, keepdims=True)
+        probs = np.exp(s) / np.exp(s).sum(axis=1, keepdims=True)
+        pred_cls = probs.argmax(axis=1)
+        top2 = np.argsort(-probs, axis=1)[:, :2]
+        hero = np.array([(hs in top2[i]) and (pred_cls[i] != hs)
+                         for i in range(len(probs))])
+        hero_idx = np.where(hero)[0]
+        if hero_idx.size:
+            hero_idx = hero_idx[np.argsort(-probs[hero_idx, hs])][:5]
+            groups["hero"] = hero_idx  # high-stakes class a strong runner-up
 
     vis_dir = os.path.join(args.output_dir, "figures")
     os.makedirs(vis_dir, exist_ok=True)
     proto_dir = os.path.join(args.output_dir, "img", "ua")
-
-    # Index into the test dataset for the chosen samples.
     test_ds = bundle.test_dataset
-    for group, idxs in (("most_uncertain", most), ("least_uncertain", least)):
+    for group, idxs in groups.items():
         for rank, gi in enumerate(idxs):
             image, label = test_ds[int(gi)][0], int(labels[int(gi)])
             save = os.path.join(vis_dir, f"{group}_{rank}_idx{int(gi)}.png")
@@ -186,10 +213,13 @@ def generate_extreme_visualizations(model, bundle, K, device, args, temperature)
                 visualize_uncertainty_explanation(
                     model, image, label, bundle.class_names,
                     prototype_image_dir=proto_dir, save_path=save,
-                    temperature=temperature, device=device)
+                    temperature=temperature, device=device,
+                    prototype_metadata=prototype_metadata)
             except Exception as e:
                 print(f"[viz] skipped {group} rank {rank}: {e}")
-    print(f"[viz] explanation figures written to {vis_dir}")
+    print(f"[viz] explanation figures written to {vis_dir}"
+          + (f" (incl. {len(groups.get('hero', []))} dangerous-miss hero cases)"
+             if "hero" in groups else ""))
 
 
 # --------------------------------------------------------------------------- #
@@ -329,7 +359,8 @@ def single_run(args, bundle, ambiguous_fn, eval_ambiguous, test_ambiguous,
                                               history.get("prototype_source"))
         with open(os.path.join(args.output_dir, "prototype_metadata.json"), "w") as f:
             json.dump(proto_meta, f, indent=2)
-        generate_extreme_visualizations(model, bundle, K, device, args, best_T)
+        generate_extreme_visualizations(model, bundle, K, device, args, best_T,
+                                        prototype_metadata=proto_meta)
 
     if args.run_baselines:
         from .baselines import EnsembleProtoPNet, MCDropoutProtoPNet

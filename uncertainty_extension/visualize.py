@@ -112,6 +112,37 @@ def _competing_prototypes_by_logits(model, logits_row, sims_row, num_classes, K,
     return out
 
 
+def _load_proto_metadata(prototype_metadata):
+    """Accept a path or a list; return {proto_global_idx: entry}."""
+    if prototype_metadata is None:
+        return {}
+    meta = prototype_metadata
+    if isinstance(meta, str) and os.path.isfile(meta):
+        try:
+            import json
+            with open(meta) as f:
+                meta = json.load(f)
+        except Exception:
+            return {}
+    if not isinstance(meta, list):
+        return {}
+    return {int(e.get("proto_idx", i)): e for i, e in enumerate(meta)}
+
+
+def _proto_label(meta_by_idx, comp):
+    """Caption suffix with provenance: dx_type/localization (HAM) or characteristics."""
+    base = comp["class_name"]
+    e = meta_by_idx.get(comp["proto_global_idx"])
+    if not e:
+        return base
+    extra = []
+    if e.get("tags"):                       # HAM: [dx, dx_type, localization]
+        extra = [str(t) for t in e["tags"][1:] if t]
+    elif e.get("characteristics"):          # LIDC/LUNA22
+        extra = [f"{k}={v}" for k, v in e["characteristics"].items()]
+    return base + (" — " + ", ".join(extra) if extra else "")
+
+
 # --------------------------------------------------------------------------- #
 # The headline figure
 # --------------------------------------------------------------------------- #
@@ -126,6 +157,7 @@ def visualize_uncertainty_explanation(
     save_path: Optional[str] = None,
     temperature: float = 1.0,
     device=None,
+    prototype_metadata=None,
 ):
     """4-panel interpretable-uncertainty figure for one sample.
 
@@ -170,6 +202,7 @@ def visualize_uncertainty_explanation(
     competitors = _competing_prototypes_by_logits(
         model, logits[0], sims[0], num_classes, K, list(class_names))
     top, second = competitors[0], competitors[1]
+    meta_by_idx = _load_proto_metadata(prototype_metadata)
 
     disp_img = _denormalize(image_tensor)
     img_size = disp_img.shape[0]
@@ -195,18 +228,19 @@ def visualize_uncertainty_explanation(
         (axes[1], top, "Reds", act_top),
         (axes[2], second, "Blues", act_2nd),
     ):
+        label = _proto_label(meta_by_idx, comp)
         patch = _load_prototype_patch(prototype_image_dir, comp["proto_global_idx"])
         if patch is not None:
             ax.imshow(patch)
             ax.set_title("Prototype P%d [%s]\nsimilarity=%.2f"
-                         % (comp["proto_global_idx"], comp["class_name"],
+                         % (comp["proto_global_idx"], label,
                             comp["similarity_score"]), fontsize=10)
         else:
             # No saved patch (e.g. pre-push / smoke test): show activation region.
             ax.imshow(disp_img)
             ax.imshow(overlay, cmap=cmap_color, alpha=0.5)
             ax.set_title("P%d [%s] sim=%.2f\n(patch png not found)"
-                         % (comp["proto_global_idx"], comp["class_name"],
+                         % (comp["proto_global_idx"], label,
                             comp["similarity_score"]), fontsize=10)
         ax.axis("off")
 
