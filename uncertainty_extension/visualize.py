@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Sequence
 import matplotlib
 matplotlib.use("Agg")  # headless-safe (servers / CI)
 import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib.patches import Rectangle  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
@@ -61,6 +62,21 @@ def _prototype_activation_map(model, image_tensor, proto_global_idx, out_size):
     if up.max() > 0:
         up = up / up.max()
     return up
+
+
+def _activation_bbox(act, thresh=0.6):
+    """Bounding box ``(x0, y0, x1, y1)`` of the high-activation region.
+
+    ``act`` is a [0,1]-normalized upsampled similarity map; we threshold at
+    ``thresh`` of its max and return the tight box around the resulting mask.
+    """
+    peak = float(act.max())
+    if peak <= 0:
+        return None
+    ys, xs = np.where(act >= thresh * peak)
+    if ys.size == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
 
 
 def _load_prototype_patch(prototype_image_dir, proto_global_idx,
@@ -213,13 +229,19 @@ def visualize_uncertainty_explanation(
 
     fig, axes = plt.subplots(1, 4, figsize=(20, 5.5))
 
-    # Panel 1: input + both competing heatmaps.
+    # Panel 1: input with a bounding box around each competing prototype's
+    # highest-activation region. A box (rather than a colored wash) honestly
+    # says "the model matched THIS region to a <class> exemplar" without
+    # implying a pixel-level visual resemblance (the similarity is in the
+    # network's feature space).
     axes[0].imshow(disp_img)
-    axes[0].imshow(np.dstack([np.ones_like(act_top), np.zeros_like(act_top),
-                              np.zeros_like(act_top), 0.45 * act_top]))
-    axes[0].imshow(np.dstack([np.zeros_like(act_2nd), np.zeros_like(act_2nd),
-                              np.ones_like(act_2nd), 0.45 * act_2nd]))
-    axes[0].set_title("Input + competing regions\n(red=%s, blue=%s)"
+    for act, color in ((act_top, "red"), (act_2nd, "blue")):
+        bb = _activation_bbox(act, thresh=0.6)
+        if bb is not None:
+            x0, y0, x1, y1 = bb
+            axes[0].add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False,
+                                        edgecolor=color, linewidth=2.5))
+    axes[0].set_title("Input + matched regions\n(red box: %s, blue box: %s)"
                       % (top["class_name"], second["class_name"]), fontsize=10)
     axes[0].axis("off")
 
