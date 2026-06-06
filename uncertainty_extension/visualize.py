@@ -27,11 +27,7 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
 from .pp_compat import forward_with_similarity, get_prototypes_per_class, unwrap  # noqa: E402
-from .uncertainty_scores import (  # noqa: E402
-    compute_class_evidence,
-    compute_uncertainty_entropy,
-    get_competing_prototypes,
-)
+from .uncertainty_scores import compute_uncertainty_entropy  # noqa: E402
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406])
 IMAGENET_STD = np.array([0.229, 0.224, 0.225])
@@ -87,6 +83,35 @@ def _load_prototype_patch(prototype_image_dir, proto_global_idx,
     return None
 
 
+def _competing_prototypes_by_logits(model, logits_row, sims_row, num_classes, K,
+                                    class_names):
+    """Top-2 competing classes/prototypes grounded in the model's decision.
+
+    The two competing classes are the top-2 by **logit** (what the model is
+    actually deciding between). For each, the representative prototype is the one
+    of that class contributing most to its logit, i.e. ``argmax_p activation_p *
+    last_layer.weight[c, p]`` over the class's prototypes. This avoids the
+    class-evidence failure where near-uniform max-similarities surface arbitrary,
+    clinically irrelevant 'magnet' prototypes.
+    """
+    base = unwrap(model)
+    W = base.last_layer.weight.detach().to(sims_row.device)   # [C, P]
+    top2 = torch.topk(logits_row, k=min(2, num_classes)).indices.tolist()
+    out = []
+    for rank, c in enumerate(top2):
+        start, end = c * K, (c + 1) * K
+        contrib = sims_row[start:end] * W[c, start:end]       # per-prototype contribution
+        local = int(torch.argmax(contrib).item())
+        gidx = start + local
+        out.append({
+            "rank": rank, "class_id": int(c), "proto_local_idx": local,
+            "proto_global_idx": int(gidx),
+            "similarity_score": float(sims_row[gidx]),
+            "class_name": class_names[c],
+        })
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # The headline figure
 # --------------------------------------------------------------------------- #
@@ -133,12 +158,17 @@ def visualize_uncertainty_explanation(
     K = get_prototypes_per_class(model)
 
     logits, _min_d, sims = forward_with_similarity(model, image_tensor)
-    class_evidence = compute_class_evidence(sims, num_classes, K)  # [1, C]
-    uncertainty = float(compute_uncertainty_entropy(class_evidence, temperature)[0])
+    probs = torch.softmax(logits, dim=1)[0]
+    # Uncertainty from the actual decision (logits), consistent with evaluation.
+    uncertainty = float(compute_uncertainty_entropy(logits, temperature)[0])
     pred = int(logits.argmax(dim=1)[0].item())
 
-    competitors = get_competing_prototypes(
-        sims[0], num_classes, K, class_names=list(class_names))
+    # Competing prototypes are grounded in the DECISION: the top-2 classes by
+    # logit, and for each the prototype contributing most to that class's logit
+    # (activation x last-layer weight). This shows the classes the model is
+    # actually torn between, not arbitrary high-similarity 'magnet' prototypes.
+    competitors = _competing_prototypes_by_logits(
+        model, logits[0], sims[0], num_classes, K, list(class_names))
     top, second = competitors[0], competitors[1]
 
     disp_img = _denormalize(image_tensor)
@@ -180,17 +210,17 @@ def visualize_uncertainty_explanation(
                             comp["similarity_score"]), fontsize=10)
         ax.axis("off")
 
-    # Panel 4: class-evidence bar chart.
-    evidence = class_evidence[0].cpu().numpy()
+    # Panel 4: model class-probability bar chart (the actual decision).
+    prob_np = probs.cpu().numpy()
     colors = ["tab:gray"] * num_classes
     colors[top["class_id"]] = "tab:red"
     colors[second["class_id"]] = "tab:blue"
-    axes[3].barh(range(num_classes), evidence, color=colors)
+    axes[3].barh(range(num_classes), prob_np, color=colors)
     axes[3].set_yticks(range(num_classes))
     axes[3].set_yticklabels(list(class_names), fontsize=8)
     axes[3].invert_yaxis()
-    axes[3].set_xlabel("Class evidence (max prototype similarity)")
-    axes[3].set_title("Class evidence", fontsize=10)
+    axes[3].set_xlabel("Model probability")
+    axes[3].set_title("Predicted class distribution", fontsize=10)
     axes[3].text(0.97, 0.04, f"U = {uncertainty:.3f}",
                  transform=axes[3].transAxes, ha="right", va="bottom",
                  fontsize=12, fontweight="bold",
