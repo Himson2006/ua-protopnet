@@ -229,18 +229,60 @@ def _luna22_hard_label(mean_malignancy: float) -> int:
     return 2
 
 
-def _load_nii_slice(path: str, slice_axis: int = 2) -> np.ndarray:
-    """Load a .nii.gz patch and return its centered 2D slice along ``slice_axis``."""
+def _load_nii_volume(path: str) -> np.ndarray:
+    """Load a .nii.gz patch as a 3D float32 array in (x, y, z) order."""
     try:
         import nibabel as nib
-        vol = np.asarray(nib.load(path).get_fdata(), dtype=np.float32)
+        return np.asarray(nib.load(path).get_fdata(), dtype=np.float32)
     except Exception:
         import SimpleITK as sitk
         # SimpleITK returns (z, y, x); transpose to (x, y, z) to match the spec.
-        vol = np.transpose(sitk.GetArrayFromImage(sitk.ReadImage(path)), (2, 1, 0))
-        vol = vol.astype(np.float32)
-    center = vol.shape[slice_axis] // 2
-    return np.take(vol, center, axis=slice_axis)
+        return np.transpose(
+            sitk.GetArrayFromImage(sitk.ReadImage(path)), (2, 1, 0)).astype(np.float32)
+
+
+def _load_nii_slice(path: str, slice_axis: int = 2) -> np.ndarray:
+    """Load a .nii.gz patch and return its centered 2D slice along ``slice_axis``."""
+    vol = _load_nii_volume(path)
+    return np.take(vol, vol.shape[slice_axis] // 2, axis=slice_axis)
+
+
+def _build_repr(vol: np.ndarray, slice_axis: int, slices: int, slice_gap: int,
+                mip: int) -> np.ndarray:
+    """Build the 2.5D representation of a centered nodule volume.
+
+    Returns a 2D array ``[H, W]`` (single channel, replicated downstream) or a
+    3-channel array ``[3, H, W]`` (multi-slice). Priority: ``mip`` > ``slices``.
+
+    * ``mip > 0``: max-intensity projection over ``mip`` central slices -> [H,W]
+      (captures the nodule's full solid extent in one image).
+    * ``slices == 3``: three slices at center and center +/- ``slice_gap`` stacked
+      as channels -> [3,H,W] (gives the network cross-slice/3D context — the
+      morphology that drives radiologist disagreement).
+    * else: the single central slice -> [H,W].
+    """
+    depth = vol.shape[slice_axis]
+    cz = depth // 2
+    if mip and mip > 1:
+        lo, hi = max(0, cz - mip // 2), min(depth, cz + mip // 2 + 1)
+        sub = np.take(vol, range(lo, hi), axis=slice_axis)
+        return np.max(sub, axis=slice_axis)
+    if slices == 3:
+        chans = []
+        for off in (-slice_gap, 0, slice_gap):
+            z = int(np.clip(cz + off, 0, depth - 1))
+            chans.append(np.take(vol, z, axis=slice_axis))
+        return np.stack(chans, axis=0)            # [3, H, W]
+    return np.take(vol, cz, axis=slice_axis)       # [H, W]
+
+
+def _center_crop_2d(arr: np.ndarray, size: int) -> np.ndarray:
+    """Central size x size crop of a 2D array (nodule is centered in the patch)."""
+    h, w = arr.shape
+    if size is None or size >= min(h, w):
+        return arr
+    top, left = (h - size) // 2, (w - size) // 2
+    return arr[top:top + size, left:left + size]
 
 
 def _center_crop_2d(arr: np.ndarray, size: int) -> np.ndarray:
@@ -259,6 +301,9 @@ def extract_luna22_dataset(
     slice_axis: int = 2,
     hu_window: bool = True,
     crop: Optional[int] = None,
+    slices: int = 1,
+    slice_gap: int = 4,
+    mip: int = 0,
     log=print,
 ) -> str:
     """Build the standard LIDC cache from LUNA22-ISMI preprocessed patches.
@@ -313,18 +358,26 @@ def extract_luna22_dataset(
             n_missing += 1
             continue
         try:
-            sl = _load_nii_slice(path, slice_axis=slice_axis)
+            vol = _load_nii_volume(path)
+            rep = _build_repr(vol, slice_axis, slices, slice_gap, mip)
         except Exception as e:
             log(f"[luna22] skip {fname}: load failed ({e})")
             continue
-        if hu_window:
-            sl = _window_normalize(sl)
-        else:
-            mn, mx = float(sl.min()), float(sl.max())
-            sl = (sl - mn) / (mx - mn + 1e-8)
-        if crop:
-            sl = _center_crop_2d(sl, crop)   # zoom in on the centered nodule
-        sl = _resize_2d(sl.astype(np.float32), patch_size)
+
+        def _proc(plane: np.ndarray) -> np.ndarray:
+            if hu_window:
+                plane = _window_normalize(plane)
+            else:
+                mn, mx = float(plane.min()), float(plane.max())
+                plane = (plane - mn) / (mx - mn + 1e-8)
+            if crop:
+                plane = _center_crop_2d(plane, crop)  # zoom in on centered nodule
+            return _resize_2d(plane.astype(np.float32), patch_size)
+
+        if rep.ndim == 3:                      # [3, H, W] multi-slice
+            sl = np.stack([_proc(rep[c]) for c in range(rep.shape[0])], axis=0)
+        else:                                  # [H, W] single slice / MIP
+            sl = _proc(rep)
 
         mal = [float(m) for m in nod["Malignancy"]]
         mean_mal = float(np.mean(mal))
@@ -355,9 +408,11 @@ def extract_luna22_dataset(
         json.dump(records, f, indent=2)
     dist = {LIDC_CLASSES[c]: sum(r["hard_label"] == c for r in records)
             for c in range(NUM_CLASSES)}
-    crop_note = f"crop={crop}->{patch_size}" if crop else f"no-crop->{patch_size}"
-    log(f"[luna22] cached {len(patches)} patches ({crop_note}) -> {npz_path}  "
-        f"class dist={dist}")
+    crop_note = f"crop={crop}->{patch_size}" if crop else f"->{patch_size}"
+    zmode = (f"mip{mip}" if mip and mip > 1 else
+             ("multi3" if slices == 3 else "center"))
+    log(f"[luna22] cached {len(patches)} patches (zmode={zmode}, {crop_note}, "
+        f"shape={np.stack(patches).shape}) -> {npz_path}  class dist={dist}")
     return npz_path
 
 
@@ -418,13 +473,16 @@ class LIDCDataset(Dataset):
         return len(self.records)
 
     def __getitem__(self, idx: int):
-        patch = torch.tensor(self.patches[idx], dtype=torch.float32)  # [64,64] in [0,1]
-        if self.train:
+        patch = torch.tensor(self.patches[idx], dtype=torch.float32)
+        if patch.dim() == 2:                       # [H,W] single slice / MIP
+            image = patch.unsqueeze(0).repeat(3, 1, 1)   # grayscale -> 3 channels
+        else:                                      # [3,H,W] multi-slice (2.5D)
+            image = patch
+        if self.train:                             # flip spatial dims of [3,H,W]
             if torch.rand(()) < 0.5:
-                patch = torch.flip(patch, dims=[1])
+                image = torch.flip(image, dims=[2])
             if torch.rand(()) < 0.5:
-                patch = torch.flip(patch, dims=[0])
-        image = patch.unsqueeze(0).repeat(3, 1, 1)   # grayscale -> 3 channels
+                image = torch.flip(image, dims=[1])
         if self.normalize:
             image = (image - self._mean) / self._std
         rec = self.records[idx]
@@ -659,6 +717,14 @@ if __name__ == "__main__":
     p.add_argument("--crop", type=int, default=None,
                    help="LUNA22: central crop (in the 128px patch) around the "
                         "nodule BEFORE resizing — zooms in (try 64). Default: none.")
+    p.add_argument("--slices", type=int, default=1, choices=[1, 3],
+                   help="LUNA22 2.5D: 3 = stack center & center+/-gap slices as "
+                        "RGB channels (cross-slice context). Default 1.")
+    p.add_argument("--slice_gap", type=int, default=4,
+                   help="Z-gap between the 3 slices when --slices 3.")
+    p.add_argument("--mip", type=int, default=0,
+                   help="LUNA22 2.5D: max-intensity projection over N central "
+                        "slices (single channel). Overrides --slices. Try 9.")
     p.add_argument("--max_scans", type=int, default=None,
                    help="Limit scans processed for pylidc (use e.g. 20 for a quick test)")
     p.add_argument("--verify", action="store_true",
@@ -673,7 +739,9 @@ if __name__ == "__main__":
         p.error("--data_dir is required (the cache output directory)")
     if args.from_luna22:
         extract_luna22_dataset(args.from_luna22, args.data_dir,
-                               patch_size=args.patch_size, crop=args.crop)
+                               patch_size=args.patch_size, crop=args.crop,
+                               slices=args.slices, slice_gap=args.slice_gap,
+                               mip=args.mip)
     elif args.build:
         extract_lidc_dataset(args.data_dir, max_scans=args.max_scans)
     bundle = get_lidc_dataloaders(args.data_dir, build_if_missing=args.build)
