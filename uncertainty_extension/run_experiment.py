@@ -186,20 +186,34 @@ def generate_extreme_visualizations(model, bundle, K, device, args, temperature,
     order = np.argsort(unc)
     groups = {"most_uncertain": order[-5:][::-1], "least_uncertain": order[:5]}
 
-    # Hero (dangerous-miss) selection from the decision distribution.
+    # Hero (dangerous-miss) selection: cases where the high-stakes class (e.g.
+    # melanoma) is a strong top-2 competitor but is NOT the prediction, i.e. the
+    # model is leaning the *wrong* (benign) way. We surface the strongest such
+    # cases, prioritizing (i) genuine NEAR-TIES (small top1-top2 probability gap,
+    # where the competing-prototype explanation is most compelling) and (ii) true
+    # dangerous misses (ground-truth label == the high-stakes class).
     hs = _high_stakes_class(args, bundle)
     if hs is not None and "score" in pred:
         s = pred["score"]
         s = s - s.max(axis=1, keepdims=True)
         probs = np.exp(s) / np.exp(s).sum(axis=1, keepdims=True)
+        sorted_p = np.sort(probs, axis=1)[:, ::-1]
+        gap = sorted_p[:, 0] - sorted_p[:, 1]          # 0 = perfect tie
         pred_cls = probs.argmax(axis=1)
         top2 = np.argsort(-probs, axis=1)[:, :2]
-        hero = np.array([(hs in top2[i]) and (pred_cls[i] != hs)
-                         for i in range(len(probs))])
-        hero_idx = np.where(hero)[0]
-        if hero_idx.size:
-            hero_idx = hero_idx[np.argsort(-probs[hero_idx, hs])][:5]
-            groups["hero"] = hero_idx  # high-stakes class a strong runner-up
+        is_competitor = np.array([hs in top2[i] for i in range(len(probs))])
+        cand = np.where(is_competitor & (pred_cls != hs))[0]
+        if cand.size:
+            is_miss = (labels[cand] == hs).astype(int)   # true high-stakes case
+            # Primary: dangerous misses first; secondary: closest tie first.
+            order_c = np.lexsort((gap[cand], -is_miss))
+            groups["hero"] = cand[order_c][:5]
+            h0 = int(groups["hero"][0])
+            tl = labels[h0]
+            tname = (bundle.class_names[tl] if 0 <= tl < bundle.num_classes else str(tl))
+            print(f"[viz] best hero (hero_0): true={tname}, "
+                  f"pred={bundle.class_names[pred_cls[h0]]}, "
+                  f"top1-top2 gap={gap[h0]:.3f} (smaller = tighter competition)")
 
     vis_dir = os.path.join(args.output_dir, "figures")
     os.makedirs(vis_dir, exist_ok=True)
