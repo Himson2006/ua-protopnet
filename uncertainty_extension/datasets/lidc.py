@@ -63,6 +63,24 @@ def malignancy_to_hard_label(mean_malignancy: float) -> int:
     return 2
 
 
+def votes_to_binary_soft(scores: List[float]) -> np.ndarray:
+    """Binary [P_benign, P_malignant] soft target from per-radiologist 1-5 scores.
+
+    Malignant-leaning votes (score >= 4) and benign-leaning votes (score <= 2)
+    count fully; indeterminate votes (score == 3) split half/half. The result
+    sums to 1, and its entropy reflects inter-radiologist disagreement — so
+    training the model to match it makes the model's confidence track agreement.
+
+    Example: malignancy [2,2,4,4] -> [0.5, 0.5] (max disagreement);
+             malignancy [5,4,5,5] -> [0.0, 1.0] (consensus).
+    """
+    s = np.asarray(scores, dtype=float)
+    n = len(s)
+    p_mal = (np.sum(s >= 4) + 0.5 * np.sum(s == 3)) / n
+    p_ben = (np.sum(s <= 2) + 0.5 * np.sum(s == 3)) / n
+    return np.array([p_ben, p_mal], dtype=np.float32)
+
+
 def votes_to_soft_label(scores: List[float]) -> np.ndarray:
     """Convert per-radiologist 1-5 scores into a [benign, uncertain, malignant]
     vote-fraction distribution.
@@ -458,7 +476,7 @@ class LIDCDataset(Dataset):
 
     def __init__(self, patches: np.ndarray, records: List[dict],
                  train: bool = False, normalize: bool = True,
-                 label_key: str = "hard_label"):
+                 label_key: str = "hard_label", soft_key: str = "soft_label"):
         self.patches = patches
         self.records = records
         self.train = train
@@ -466,6 +484,7 @@ class LIDCDataset(Dataset):
         # Which record field supplies the integer class label. Binary mode uses
         # 'binary_label' (0=benign, 1=malignant, -1=held-out ambiguous).
         self.label_key = label_key
+        self.soft_key = soft_key
         self._mean = torch.tensor(IMAGENET_MEAN).view(3, 1, 1)
         self._std = torch.tensor(IMAGENET_STD).view(3, 1, 1)
 
@@ -487,7 +506,8 @@ class LIDCDataset(Dataset):
             image = (image - self._mean) / self._std
         rec = self.records[idx]
         hard = int(rec.get(self.label_key, rec["hard_label"]))
-        soft = torch.tensor(rec["soft_label"], dtype=torch.float32)
+        soft = torch.tensor(rec.get(self.soft_key, rec["soft_label"]),
+                            dtype=torch.float32)
         std = float(rec["std_malignancy"])
         return image, hard, soft, std
 
@@ -532,6 +552,25 @@ def _stratified_split(records, seed, ratios):
 BINARY_CLASSES = ["benign", "malignant"]
 #: Sentinel label for held-out ambiguous (indeterminate) nodules in binary mode.
 BINARY_AMBIGUOUS_LABEL = -1
+
+
+def _split_by_label(records, seed, ratios, key, n_classes):
+    """Stratified train/val/test split over an integer record field ``key``."""
+    rng = np.random.RandomState(seed)
+    by = {c: [] for c in range(n_classes)}
+    for i, r in enumerate(records):
+        by[int(r[key])].append(i)
+    train, val, test = [], [], []
+    for _cls, idxs in by.items():
+        idxs = np.array(idxs)
+        rng.shuffle(idxs)
+        m = len(idxs)
+        n_tr = int(round(m * ratios[0]))
+        n_va = int(round(m * ratios[1]))
+        train += idxs[:n_tr].tolist()
+        val += idxs[n_tr:n_tr + n_va].tolist()
+        test += idxs[n_tr + n_va:].tolist()
+    return train, val, test
 
 
 def _binary_split(records, seed, ratios):
@@ -585,6 +624,7 @@ def get_lidc_dataloaders(
     max_samples: Optional[int] = None,
     build_if_missing: bool = True,
     binary: bool = False,
+    binary_soft: bool = False,
     log=print,
 ) -> LIDCBundle:
     """Build train/val/test loaders for the cached LIDC dataset.
@@ -618,7 +658,22 @@ def get_lidc_dataloaders(
         patches = patches[idx]
         records = [records[i] for i in idx]
 
-    if binary:
+    soft_key = "soft_label"
+    if binary_soft:
+        # Soft regression of P(malignant) from the radiologist vote fraction.
+        # All nodules are trainable (no held-out class); confidence is calibrated
+        # to agreement by construction. is_ambiguous flags the indeterminate
+        # nodules (mean 2.5-3.5) for the ambiguous/clear evaluation.
+        for r in records:
+            soft2 = votes_to_binary_soft(r["malignancy_scores"])
+            r["binary_soft2"] = [float(soft2[0]), float(soft2[1])]
+            r["binary_label"] = int(soft2[1] >= 0.5)
+            r["is_ambiguous"] = bool(int(r["hard_label"]) == 1)
+        tr, va, te = _split_by_label(records, seed, ratios, "binary_label", 2)
+        label_key, soft_key = "binary_label", "binary_soft2"
+        class_names, num_classes = list(BINARY_CLASSES), 2
+        amb_label = None  # eval uses an is_ambiguous mask (see run_experiment)
+    elif binary:
         # benign(0)->0, malignant(2)->1, indeterminate(1)->-1 (held out)
         for r in records:
             r["binary_label"] = {0: 0, 2: 1}.get(int(r["hard_label"]), -1)
@@ -635,7 +690,8 @@ def get_lidc_dataloaders(
     def subset(indices, train, normalize=True):
         idx = np.array(indices)
         return LIDCDataset(patches[idx], [records[i] for i in indices],
-                           train=train, normalize=normalize, label_key=label_key)
+                           train=train, normalize=normalize,
+                           label_key=label_key, soft_key=soft_key)
 
     train_ds = subset(tr, True)
     val_ds = subset(va, False)
@@ -643,7 +699,12 @@ def get_lidc_dataloaders(
     # Push set: train images, UNnormalized [0,1] 3-channel, for prototype saving.
     push_ds = subset(tr, False, normalize=False)
 
-    if binary:
+    if binary_soft:
+        n_amb = sum(1 for i in te if records[i].get("is_ambiguous"))
+        log(f"[lidc] binary-soft mode: train={len(tr)} val={len(va)} "
+            f"test={len(te)} ({n_amb} indeterminate nodules in test); "
+            f"soft P(malignant) regression")
+    elif binary:
         n_amb = sum(1 for i in te if records[i]["binary_label"] == -1)
         log(f"[lidc] binary mode: train={len(tr)} val={len(va)} "
             f"test={len(te)} (incl. {n_amb} held-out ambiguous nodules)")

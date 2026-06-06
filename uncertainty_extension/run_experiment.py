@@ -57,15 +57,24 @@ def setup_dataset(args):
         ambiguous_label = _pairs_to_class_indices(DEFAULT_AMBIGUOUS_PAIRS)
         return bundle, ambiguous_fn, ambiguous_label, False
     elif args.dataset == "lidc":
+        import torch
         from .datasets.lidc import (AMBIGUOUS_LABEL, BINARY_AMBIGUOUS_LABEL,
                                     get_ambiguous_mask, get_lidc_dataloaders)
-        bundle = get_lidc_dataloaders(args.data_dir, binary=args.binary, **common)
+        if args.binary_soft:
+            # Soft P(malignant) regression: the soft labels do the work, so no
+            # calibration loss (ambiguous_fn marks nothing). Ambiguous eval group
+            # is an is_ambiguous mask, computed per-split in main().
+            bundle = get_lidc_dataloaders(args.data_dir, binary_soft=True, **common)
+            ambiguous_fn = lambda labels: torch.zeros_like(labels, dtype=torch.bool)
+            return bundle, ambiguous_fn, None, True
         if args.binary:
             # Held-out indeterminate nodules carry label -1; nothing in the
             # train set is ambiguous, so the calibration loss just enforces
             # certainty on the (confident) training samples. Hard labels only.
+            bundle = get_lidc_dataloaders(args.data_dir, binary=True, **common)
             ambiguous_fn = lambda labels: labels == BINARY_AMBIGUOUS_LABEL
             return bundle, ambiguous_fn, bundle.ambiguous_label, False
+        bundle = get_lidc_dataloaders(args.data_dir, **common)
         ambiguous_fn = get_ambiguous_mask
         return bundle, ambiguous_fn, AMBIGUOUS_LABEL, True
     raise ValueError(f"unknown dataset {args.dataset!r}")
@@ -259,6 +268,10 @@ def build_parser():
                    help="LIDC: train benign-vs-malignant on confident nodules; "
                         "hold out the indeterminate nodules as the ambiguous test "
                         "set (recommended — the 3-class task is not learnable).")
+    p.add_argument("--binary_soft", action="store_true",
+                   help="LIDC: train P(malignant) to match the radiologist vote "
+                        "fraction (soft regression). Confidence is calibrated to "
+                        "agreement, so uncertainty should track radiologist std.")
     p.add_argument("--uncertainty_source", choices=["logits", "evidence"],
                    default="logits",
                    help="Compute uncertainty from softmax(logits) (default, "
@@ -284,11 +297,22 @@ def main(argv: Optional[List[str]] = None):
           f"test={len(bundle.test_dataset)} classes={bundle.num_classes} "
           f"soft_labels={use_soft}")
 
+    # In binary-soft mode the ambiguous (indeterminate) nodules cut across both
+    # classes, so the ambiguous group is a per-split boolean mask rather than a
+    # label value. Otherwise val and test share the same label-based group.
+    if args.binary_soft:
+        eval_ambiguous = np.array([r["is_ambiguous"]
+                                   for r in bundle.val_dataset.records], dtype=bool)
+        test_ambiguous = np.array([r["is_ambiguous"]
+                                   for r in bundle.test_dataset.records], dtype=bool)
+    else:
+        eval_ambiguous = test_ambiguous = ambiguous_label
+
     results: Dict[str, dict] = {}
 
     # ---- Train UA-ProtoPNet (ours) ------------------------------------- #
     model, history, K = train_one_model(
-        args, bundle, ambiguous_fn, ambiguous_label, use_soft, device,
+        args, bundle, ambiguous_fn, eval_ambiguous, use_soft, device,
         args.lambda_u, args.lambda_div, tag="ua", seed=args.seed)
 
     # Did the model ever fit the training data? (best train acc across epochs)
@@ -305,7 +329,7 @@ def main(argv: Optional[List[str]] = None):
     # ---- Test evaluation ----------------------------------------------- #
     results["ua"] = run_full_evaluation(
         model, bundle.test_loader, bundle.num_classes, K, device,
-        ambiguous_label=ambiguous_label, temperature=best_T,
+        ambiguous_label=test_ambiguous, temperature=best_T,
         uncertainty_source=args.uncertainty_source)
     results["ua"]["provides_prototype_explanation"] = True
     results["ua"]["best_train_acc"] = float(best_train_acc)
@@ -322,29 +346,29 @@ def main(argv: Optional[List[str]] = None):
 
         # Vanilla: same architecture trained WITHOUT uncertainty terms.
         vanilla, _vh, _vk = train_one_model(
-            args, bundle, ambiguous_fn, ambiguous_label, use_soft, device,
+            args, bundle, ambiguous_fn, eval_ambiguous, use_soft, device,
             lambda_u=0.0, lambda_div=0.0, tag="vanilla", seed=args.seed + 1)
         results["vanilla"] = run_full_evaluation(
             vanilla, bundle.test_loader, bundle.num_classes, K, device,
-            ambiguous_label=ambiguous_label, temperature=best_T,
+            ambiguous_label=test_ambiguous, temperature=best_T,
             uncertainty_source=args.uncertainty_source)
 
         mc = MCDropoutProtoPNet(vanilla, n_samples=30)
         results["mc_dropout"] = run_full_evaluation(
             mc, bundle.test_loader, bundle.num_classes, K, device,
-            ambiguous_label=ambiguous_label, temperature=best_T,
+            ambiguous_label=test_ambiguous, temperature=best_T,
             forward_fn=mc.forward_fn())
 
         members = [vanilla]
         for s in range(1, max(1, args.ensemble_size)):
             mem, _h, _k = train_one_model(
-                args, bundle, ambiguous_fn, ambiguous_label, use_soft, device,
+                args, bundle, ambiguous_fn, eval_ambiguous, use_soft, device,
                 lambda_u=0.0, lambda_div=0.0, tag=f"ens_{s}", seed=args.seed + 10 + s)
             members.append(mem)
         ens = EnsembleProtoPNet(members)
         results["ensemble"] = run_full_evaluation(
             ens, bundle.test_loader, bundle.num_classes, K, device,
-            ambiguous_label=ambiguous_label, temperature=best_T,
+            ambiguous_label=test_ambiguous, temperature=best_T,
             forward_fn=ens.forward_fn())
 
     # ---- Save + print --------------------------------------------------- #
