@@ -221,6 +221,28 @@ def generate_extreme_visualizations(model, bundle, K, device, args, temperature,
           + (f" (incl. {len(groups.get('hero', []))} dangerous-miss hero cases)"
              if "hero" in groups else ""))
 
+    # Summary plots: per-class uncertainty distribution, and (LIDC) the
+    # uncertainty-vs-radiologist-std scatter for the negative-result section.
+    from .visualize import plot_correlation_scatter, plot_uncertainty_distribution
+    try:
+        by_class = {bundle.class_names[c]: unc[labels == c]
+                    for c in range(bundle.num_classes) if (labels == c).any()}
+        if (labels < 0).any():
+            by_class["indeterminate"] = unc[labels < 0]
+        plot_uncertainty_distribution(
+            by_class, list(by_class.keys()),
+            save_path=os.path.join(vis_dir, "uncertainty_distribution.png"))
+    except Exception as e:
+        print(f"[viz] skipped distribution plot: {e}")
+    if "radiologist_std" in pred:
+        try:
+            plot_correlation_scatter(
+                unc, pred["radiologist_std"],
+                save_path=os.path.join(vis_dir, "correlation_scatter.png"),
+                hard_labels=np.clip(labels, 0, None))
+        except Exception as e:
+            print(f"[viz] skipped correlation scatter: {e}")
+
 
 # --------------------------------------------------------------------------- #
 # Results table
