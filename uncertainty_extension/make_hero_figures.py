@@ -87,24 +87,12 @@ def main(argv=None):
         prototypes_per_class=a.num_prototypes_per_class, pretrained=False).to(device)
     K = get_prototypes_per_class(model)
     ckpt_dir = os.path.join(cli.output_dir, "ckpt", "ua")
-    ckpt_path = os.path.join(ckpt_dir, "latest.pth")
-    state = load_checkpoint(model, {}, ckpt_dir, device)
-    if state is None:
-        raise FileNotFoundError(f"No checkpoint at {ckpt_path}")
-    import time
-    mtime = time.strftime("%Y-%m-%d %H:%M",
-                          time.localtime(os.path.getmtime(ckpt_path)))
-    print(f"[hero] LOADED MODEL: {os.path.abspath(ckpt_path)}")
-    print(f"[hero]   saved at epoch={state.get('epoch')} "
-          f"phase={state.get('phase')!r}  (file last modified {mtime})")
+    if load_checkpoint(model, {}, ckpt_dir, device) is None:
+        raise FileNotFoundError(f"No checkpoint at {ckpt_dir}/latest.pth")
     model.eval()
 
     # 3) Prototype patches + metadata + calibrated temperature.
     proto_dir = os.path.join(cli.output_dir, "img", "ua")
-    if not os.path.isdir(proto_dir):
-        print(f"[hero]   WARNING: prototype dir {proto_dir} missing "
-              "(figures will show activation regions instead of saved patches)")
-    print(f"[hero]   prototypes from: {os.path.abspath(proto_dir)}")
     meta_path = os.path.join(cli.output_dir, "prototype_metadata.json")
     proto_meta = json.load(open(meta_path)) if os.path.isfile(meta_path) else None
     best_T = calibrate_temperature(model, bundle.val_loader, bundle.num_classes,

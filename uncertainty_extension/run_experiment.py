@@ -250,10 +250,23 @@ def generate_extreme_visualizations(model, bundle, K, device, args, temperature,
         print(f"[viz] skipped distribution plot: {e}")
     if "radiologist_std" in pred:
         try:
+            # Color by the ORIGINAL 3-class ground truth (benign/uncertain/
+            # malignant), not the binary training label, so the indeterminate
+            # nodules are visible. test_loader is unshuffled, so record order
+            # aligns with the collected predictions.
+            recs = getattr(bundle.test_dataset, "records", None)
+            if recs is not None and len(recs) == len(unc):
+                from .datasets.lidc import LIDC_CLASSES
+                scatter_labels = np.array([int(r.get("hard_label", 0))
+                                           for r in recs])
+                scatter_names = LIDC_CLASSES
+            else:
+                scatter_labels = np.clip(labels, 0, None)
+                scatter_names = bundle.class_names
             plot_correlation_scatter(
                 unc, pred["radiologist_std"],
                 save_path=os.path.join(vis_dir, "correlation_scatter.png"),
-                hard_labels=np.clip(labels, 0, None))
+                hard_labels=scatter_labels, label_names=scatter_names)
         except Exception as e:
             print(f"[viz] skipped correlation scatter: {e}")
 

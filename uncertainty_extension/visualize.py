@@ -337,8 +337,9 @@ def plot_uncertainty_distribution(
         if any(c in uncertainty_scores_by_class for c in clear) else np.array([])
     if pooled.size:
         med = float(np.median(pooled))
-        ax.axhline(med, ls="--", color="gray",
-                   label=f"clear-class median = {med:.3f}")
+        med_name = "clear-class median" if clear_class_names is not None \
+            else "overall median"
+        ax.axhline(med, ls="--", color="gray", label=f"{med_name} = {med:.3f}")
         ax.legend(loc="upper right", fontsize=8)
 
     fig.tight_layout()
