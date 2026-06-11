@@ -227,7 +227,7 @@ def visualize_uncertainty_explanation(
     act_2nd = _prototype_activation_map(model, image_tensor,
                                         second["proto_global_idx"], img_size)
 
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5.5))
+    fig, axes = plt.subplots(1, 4, figsize=(22, 6.5))
 
     # Panel 1: input with a bounding box around each competing prototype's
     # highest-activation region. A box (rather than a colored wash) honestly
@@ -242,7 +242,7 @@ def visualize_uncertainty_explanation(
             axes[0].add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False,
                                         edgecolor=color, linewidth=2.5))
     axes[0].set_title("Input + matched regions\n(red box: %s, blue box: %s)"
-                      % (top["class_name"], second["class_name"]), fontsize=10)
+                      % (top["class_name"], second["class_name"]), fontsize=13)
     axes[0].axis("off")
 
     # Panels 2 & 3: each competitor's prototype patch + activation overlay.
@@ -256,14 +256,14 @@ def visualize_uncertainty_explanation(
             ax.imshow(patch)
             ax.set_title("Prototype P%d [%s]\nsimilarity=%.2f"
                          % (comp["proto_global_idx"], label,
-                            comp["similarity_score"]), fontsize=10)
+                            comp["similarity_score"]), fontsize=13)
         else:
             # No saved patch (e.g. pre-push / smoke test): show activation region.
             ax.imshow(disp_img)
             ax.imshow(overlay, cmap=cmap_color, alpha=0.5)
             ax.set_title("P%d [%s] sim=%.2f\n(patch png not found)"
                          % (comp["proto_global_idx"], label,
-                            comp["similarity_score"]), fontsize=10)
+                            comp["similarity_score"]), fontsize=13)
         ax.axis("off")
 
     # Panel 4: model class-probability bar chart (the actual decision).
@@ -273,10 +273,10 @@ def visualize_uncertainty_explanation(
     colors[second["class_id"]] = "tab:blue"
     axes[3].barh(range(num_classes), prob_np, color=colors)
     axes[3].set_yticks(range(num_classes))
-    axes[3].set_yticklabels(list(class_names), fontsize=8)
+    axes[3].set_yticklabels(list(class_names), fontsize=11)
     axes[3].invert_yaxis()
-    axes[3].set_xlabel("Model probability")
-    axes[3].set_title("Predicted class distribution", fontsize=10)
+    axes[3].set_xlabel("Model probability", fontsize=13)
+    axes[3].set_title("Predicted class distribution", fontsize=13)
     axes[3].text(0.97, 0.04, f"U = {uncertainty:.3f}",
                  transform=axes[3].transAxes, ha="right", va="bottom",
                  fontsize=12, fontweight="bold",
@@ -286,7 +286,7 @@ def visualize_uncertainty_explanation(
                  and 0 <= true_label < num_classes else str(true_label))
     fig.suptitle(
         f"Uncertain Prediction — True: {true_name} | Model: {class_names[pred]} "
-        f"| U = {uncertainty:.3f}", fontsize=13, fontweight="bold")
+        f"| U = {uncertainty:.3f}", fontsize=15, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.94])
 
     if save_path:
@@ -321,14 +321,15 @@ def plot_uncertainty_distribution(
     names = [c for c in class_names if c in uncertainty_scores_by_class]
     data = [np.asarray(uncertainty_scores_by_class[c], dtype=float) for c in names]
 
-    fig, ax = plt.subplots(figsize=(max(6, 1.2 * len(names)), 5))
+    fig, ax = plt.subplots(figsize=(max(8, 1.5 * len(names)), 6))
     parts = ax.violinplot(data, showmeans=True, showextrema=True)
     for pc in parts["bodies"]:
         pc.set_alpha(0.6)
     ax.set_xticks(range(1, len(names) + 1))
-    ax.set_xticklabels(names, rotation=30, ha="right")
-    ax.set_ylabel("Uncertainty score U")
-    ax.set_title("Uncertainty distribution by class")
+    ax.set_xticklabels(names, rotation=30, ha="right", fontsize=13)
+    ax.set_ylabel("Uncertainty score U", fontsize=14)
+    ax.set_title("Uncertainty distribution by class", fontsize=15)
+    ax.tick_params(axis='y', labelsize=12)
 
     clear = clear_class_names if clear_class_names is not None else names
     pooled = np.concatenate(
@@ -340,7 +341,7 @@ def plot_uncertainty_distribution(
         med_name = "clear-class median" if clear_class_names is not None \
             else "overall median"
         ax.axhline(med, ls="--", color="gray", label=f"{med_name} = {med:.3f}")
-        ax.legend(loc="upper right", fontsize=8)
+        ax.legend(loc="upper right", fontsize=12)
 
     fig.tight_layout()
     if save_path:
@@ -374,14 +375,14 @@ def plot_correlation_scatter(
     from .evaluate import correlation_with_radiologist_std
     corr = correlation_with_radiologist_std(u, s)
 
-    fig, ax = plt.subplots(figsize=(6.5, 6))
+    fig, ax = plt.subplots(figsize=(8, 7))
     if hard_labels is not None:
         hl = np.asarray(hard_labels).ravel()[mask]
         for cls in np.unique(hl):
             m = hl == cls
             name = label_names[int(cls)] if int(cls) < len(label_names) else str(cls)
             ax.scatter(s[m], u[m], alpha=0.6, s=18, label=name)
-        ax.legend(title="hard label", fontsize=8)
+        ax.legend(title="hard label", fontsize=12, title_fontsize=12)
     else:
         ax.scatter(s, u, alpha=0.6, s=18)
 
@@ -391,11 +392,13 @@ def plot_correlation_scatter(
         xs = np.linspace(s.min(), s.max(), 100)
         ax.plot(xs, b * xs + a, color="black", lw=1.5, ls="--")
 
-    ax.set_xlabel("Inter-radiologist std (ground-truth aleatoric uncertainty)")
-    ax.set_ylabel("Model uncertainty U")
+    ax.set_xlabel("Inter-radiologist std (ground-truth aleatoric uncertainty)", fontsize=13)
+    ax.set_ylabel("Model uncertainty U", fontsize=13)
+    ax.tick_params(axis='both', labelsize=12)
     ax.set_title("Model uncertainty vs. radiologist disagreement\n"
                  f"Pearson r = {corr['pearson_r']:.3f}, "
-                 f"p = {corr['p_value']:.2e}  (n={corr['n_samples']})")
+                 f"p = {corr['p_value']:.2e}  (n={corr['n_samples']})",
+                 fontsize=14)
 
     fig.tight_layout()
     if save_path:
