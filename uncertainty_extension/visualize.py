@@ -227,7 +227,7 @@ def visualize_uncertainty_explanation(
     act_2nd = _prototype_activation_map(model, image_tensor,
                                         second["proto_global_idx"], img_size)
 
-    fig, axes = plt.subplots(1, 4, figsize=(22, 6.5))
+    fig, axes = plt.subplots(1, 4, figsize=(15, 4.4))
 
     # Panel 1: input with a bounding box around each competing prototype's
     # highest-activation region. A box (rather than a colored wash) honestly

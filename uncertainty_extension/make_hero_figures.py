@@ -69,8 +69,6 @@ def main(argv=None):
                    help="How many most-uncertain figures to render.")
     p.add_argument("--out_subdir", default="figures_more",
                    help="Subfolder of output_dir to write into.")
-    p.add_argument("--target_idx", type=int, default=None,
-                   help="If set, always render this specific test-set index.")
     p.add_argument("--device", default="auto")
     cli = p.parse_args(argv)
 
@@ -129,8 +127,6 @@ def main(argv=None):
                   f"(high-stakes class = {cls[hs]}); rendering top {len(groups['hero'])}")
     order_u = np.argsort(unc)
     groups["most_uncertain"] = order_u[-cli.n_uncertain:][::-1]
-    if cli.target_idx is not None:
-        groups["target"] = np.array([cli.target_idx])
 
     # 6) Render.
     out_dir = os.path.join(cli.output_dir, cli.out_subdir)
