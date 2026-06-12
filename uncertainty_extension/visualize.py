@@ -382,10 +382,9 @@ def plot_correlation_scatter(
             m = hl == cls
             name = label_names[int(cls)] if int(cls) < len(label_names) else str(cls)
             ax.scatter(s[m], u[m], alpha=0.6, s=18, label=name)
-        ax.legend(title="hard label", fontsize=24, title_fontsize=24,
-                  loc="upper left", bbox_to_anchor=(1.01, 1.0),
-                  markerscale=1.5, borderpad=0.4, labelspacing=0.3,
-                  handletextpad=0.3, framealpha=0.95)
+        ax.legend(title="hard label", fontsize=16, title_fontsize=16,
+                  loc="center right", markerscale=1.2, borderpad=0.4,
+                  labelspacing=0.3, handletextpad=0.3, framealpha=0.95)
     else:
         ax.scatter(s, u, alpha=0.6, s=18)
 
