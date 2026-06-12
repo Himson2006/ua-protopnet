@@ -326,10 +326,10 @@ def plot_uncertainty_distribution(
     for pc in parts["bodies"]:
         pc.set_alpha(0.6)
     ax.set_xticks(range(1, len(names) + 1))
-    ax.set_xticklabels(names, rotation=30, ha="right", fontsize=13)
-    ax.set_ylabel("Uncertainty score U", fontsize=14)
-    ax.set_title("Uncertainty distribution by class", fontsize=15)
-    ax.tick_params(axis='y', labelsize=12)
+    ax.set_xticklabels(names, rotation=30, ha="right", fontsize=20)
+    ax.set_ylabel("Uncertainty score U", fontsize=21)
+    ax.set_title("Uncertainty distribution by class", fontsize=22)
+    ax.tick_params(axis='y', labelsize=18)
 
     clear = clear_class_names if clear_class_names is not None else names
     pooled = np.concatenate(
@@ -341,7 +341,7 @@ def plot_uncertainty_distribution(
         med_name = "clear-class median" if clear_class_names is not None \
             else "overall median"
         ax.axhline(med, ls="--", color="gray", label=f"{med_name} = {med:.3f}")
-        ax.legend(loc="upper right", fontsize=12)
+        ax.legend(loc="upper right", fontsize=18)
 
     fig.tight_layout()
     if save_path:
@@ -382,7 +382,7 @@ def plot_correlation_scatter(
             m = hl == cls
             name = label_names[int(cls)] if int(cls) < len(label_names) else str(cls)
             ax.scatter(s[m], u[m], alpha=0.6, s=18, label=name)
-        ax.legend(title="hard label", fontsize=12, title_fontsize=12)
+        ax.legend(title="hard label", fontsize=18, title_fontsize=18)
     else:
         ax.scatter(s, u, alpha=0.6, s=18)
 
@@ -392,13 +392,13 @@ def plot_correlation_scatter(
         xs = np.linspace(s.min(), s.max(), 100)
         ax.plot(xs, b * xs + a, color="black", lw=1.5, ls="--")
 
-    ax.set_xlabel("Inter-radiologist std (ground-truth aleatoric uncertainty)", fontsize=13)
-    ax.set_ylabel("Model uncertainty U", fontsize=13)
-    ax.tick_params(axis='both', labelsize=12)
+    ax.set_xlabel("Inter-radiologist std (ground-truth aleatoric uncertainty)", fontsize=20)
+    ax.set_ylabel("Model uncertainty U", fontsize=20)
+    ax.tick_params(axis='both', labelsize=18)
     ax.set_title("Model uncertainty vs. radiologist disagreement\n"
                  f"Pearson r = {corr['pearson_r']:.3f}, "
                  f"p = {corr['p_value']:.2e}  (n={corr['n_samples']})",
-                 fontsize=14)
+                 fontsize=21)
 
     fig.tight_layout()
     if save_path:
