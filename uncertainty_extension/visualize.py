@@ -321,15 +321,15 @@ def plot_uncertainty_distribution(
     names = [c for c in class_names if c in uncertainty_scores_by_class]
     data = [np.asarray(uncertainty_scores_by_class[c], dtype=float) for c in names]
 
-    fig, ax = plt.subplots(figsize=(max(8, 1.5 * len(names)), 6))
+    fig, ax = plt.subplots(figsize=(max(7, 1.1 * len(names)), 5))
     parts = ax.violinplot(data, showmeans=True, showextrema=True)
     for pc in parts["bodies"]:
         pc.set_alpha(0.6)
     ax.set_xticks(range(1, len(names) + 1))
-    ax.set_xticklabels(names, rotation=30, ha="right", fontsize=20)
-    ax.set_ylabel("Uncertainty score U", fontsize=21)
-    ax.set_title("Uncertainty distribution by class", fontsize=22)
-    ax.tick_params(axis='y', labelsize=18)
+    ax.set_xticklabels(names, rotation=30, ha="right", fontsize=26)
+    ax.set_ylabel("Uncertainty score U", fontsize=28)
+    ax.set_title("Uncertainty distribution by class", fontsize=28)
+    ax.tick_params(axis='y', labelsize=24)
 
     clear = clear_class_names if clear_class_names is not None else names
     pooled = np.concatenate(
@@ -341,7 +341,7 @@ def plot_uncertainty_distribution(
         med_name = "clear-class median" if clear_class_names is not None \
             else "overall median"
         ax.axhline(med, ls="--", color="gray", label=f"{med_name} = {med:.3f}")
-        ax.legend(loc="upper right", fontsize=18)
+        ax.legend(loc="upper right", fontsize=24)
 
     fig.tight_layout()
     if save_path:
@@ -375,14 +375,14 @@ def plot_correlation_scatter(
     from .evaluate import correlation_with_radiologist_std
     corr = correlation_with_radiologist_std(u, s)
 
-    fig, ax = plt.subplots(figsize=(8, 7))
+    fig, ax = plt.subplots(figsize=(6.8, 6))
     if hard_labels is not None:
         hl = np.asarray(hard_labels).ravel()[mask]
         for cls in np.unique(hl):
             m = hl == cls
             name = label_names[int(cls)] if int(cls) < len(label_names) else str(cls)
             ax.scatter(s[m], u[m], alpha=0.6, s=18, label=name)
-        ax.legend(title="hard label", fontsize=18, title_fontsize=18)
+        ax.legend(title="hard label", fontsize=24, title_fontsize=24)
     else:
         ax.scatter(s, u, alpha=0.6, s=18)
 
@@ -392,13 +392,13 @@ def plot_correlation_scatter(
         xs = np.linspace(s.min(), s.max(), 100)
         ax.plot(xs, b * xs + a, color="black", lw=1.5, ls="--")
 
-    ax.set_xlabel("Inter-radiologist std (ground-truth aleatoric uncertainty)", fontsize=20)
-    ax.set_ylabel("Model uncertainty U", fontsize=20)
-    ax.tick_params(axis='both', labelsize=18)
+    ax.set_xlabel("Inter-radiologist std (ground-truth aleatoric uncertainty)", fontsize=24)
+    ax.set_ylabel("Model uncertainty U", fontsize=24)
+    ax.tick_params(axis='both', labelsize=22)
     ax.set_title("Model uncertainty vs. radiologist disagreement\n"
                  f"Pearson r = {corr['pearson_r']:.3f}, "
                  f"p = {corr['p_value']:.2e}  (n={corr['n_samples']})",
-                 fontsize=21)
+                 fontsize=25)
 
     fig.tight_layout()
     if save_path:
