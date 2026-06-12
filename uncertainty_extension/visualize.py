@@ -321,7 +321,7 @@ def plot_uncertainty_distribution(
     names = [c for c in class_names if c in uncertainty_scores_by_class]
     data = [np.asarray(uncertainty_scores_by_class[c], dtype=float) for c in names]
 
-    fig, ax = plt.subplots(figsize=(max(7, 1.1 * len(names)), 5))
+    fig, ax = plt.subplots(figsize=(max(10, 1.5 * len(names)), 7))
     parts = ax.violinplot(data, showmeans=True, showextrema=True)
     for pc in parts["bodies"]:
         pc.set_alpha(0.6)
@@ -375,7 +375,7 @@ def plot_correlation_scatter(
     from .evaluate import correlation_with_radiologist_std
     corr = correlation_with_radiologist_std(u, s)
 
-    fig, ax = plt.subplots(figsize=(6.8, 6))
+    fig, ax = plt.subplots(figsize=(9, 8))
     if hard_labels is not None:
         hl = np.asarray(hard_labels).ravel()[mask]
         for cls in np.unique(hl):
